@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from test_relay import m
+from test_relay import approved_test_task, m, seed_agent
 
 
 class HerdrAgentStatusTests(unittest.TestCase):
@@ -13,20 +13,24 @@ class HerdrAgentStatusTests(unittest.TestCase):
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         for key in ('STATE', 'REGISTRY', 'TASKS', 'EVENTS', 'SEMANTIC', 'REVIEWS', 'LOCKS'):
             self.enterContext(patch.object(m, key, root / key))
-        m.save_registry({'agents': {'worker': {'lifecycle': 'IDLE'}}})
+        self.enterContext(patch.object(m,"HERDR_SESSION","relay-test-session"))
+        seed_agent()
         m.ensure()
         self.markers = []
         self.enterContext(patch.object(m, 'run', side_effect=self.fake_run))
 
     def fake_run(self, cmd, **kwargs):
-        if cmd[2] == 'prompt':
-            self.markers.append(cmd[4].splitlines()[0])
+        if 'prompt' in cmd:
+            import re
+            prompt = cmd[cmd.index('prompt') + 2]
+            self.markers.append(re.search(r'^\[RELAY TASK [^\]]+\]$',prompt,re.M).group(0))
             return subprocess.CompletedProcess(cmd, 0, '', '')
         return subprocess.CompletedProcess(cmd, 0, '\n'.join(self.markers + ['验证证据', self.markers[-1]]), '')
 
     def test_sensor_maps_agent_status_done_without_jev(self):
         with patch.object(m, "agent_status_obj", return_value={
-            "result": {"agent": {"agent_status": "done"}}
+            "result": {"agent": {"name":"worker", "tab_id":"tab-worker",
+                                   "pane_id":"pane-worker", "agent_status": "done"}}
         }), patch.object(m, "run", return_value=subprocess.CompletedProcess([], 0, "", "")), patch.object(m, "jev_call") as jev:
             result = m.sensor("worker", force=True)
         self.assertEqual(result["runtime_status"], "done")
@@ -35,16 +39,17 @@ class HerdrAgentStatusTests(unittest.TestCase):
 
     def test_delegate_accepts_agent_status_done_and_reviews(self):
         with patch.object(m, "agent_status_obj", return_value={
-            "result": {"agent": {"agent_status": "done"}}
+            "result": {"agent": {"name":"worker", "tab_id":"tab-worker",
+                                   "pane_id":"pane-worker", "agent_status": "done"}}
         }), patch.object(m, "review", return_value={"route": "PASS"}) as review:
-            state = m.delegate("worker", "完成并检查任务")
+            state = m.delegate("worker", approved_test_task(m.STATE))
         self.assertEqual(state["final_state"], "DONE")
         self.assertIn("验证证据", review.call_args.args[3])
 
     def test_async_sync_settles_agent_status_done_after_working(self):
-        task = m.dispatch_opaque("worker", "异步任务")
+        task = m.dispatch_opaque("worker", approved_test_task(m.STATE))
         def snapshot(status):
-            return {"result": {"agents": [{"name": "worker", "agent_status": status}]}}
+            return {"result": {"agents": [{"name": "worker", "agent_status": status,"tab_id":"tab-worker","pane_id":"pane-worker"}]}}
         with patch.object(m, "herdr_json", return_value=snapshot("working")):
             m.sync()
         with patch.object(m, "herdr_json", return_value=snapshot("done")):

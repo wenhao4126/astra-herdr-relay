@@ -4,21 +4,21 @@ import unittest
 from unittest.mock import patch
 
 import test_event_regression
-from test_relay import m
+from test_relay import approved_test_task, m, seed_agent
 
 
 class ConcurrencyRegressionTests(unittest.TestCase):
     setUp = test_event_regression.EventRegressionTests.setUp
 
     def seed(self):
-        m.save_registry({'agents': {'worker': {'lifecycle': 'IDLE'}}})
+        seed_agent()
 
     def dispatch(self):
         with patch.object(m, 'run', return_value=subprocess.CompletedProcess([], 0, '', '')):
-            return m.dispatch_opaque('worker', '任务')
+            return m.dispatch_opaque('worker', approved_test_task(m.STATE))
 
     def snapshot(self, status):
-        return {'result': {'agents': [{'name': 'worker', 'status': status}]}}
+        return {'result': {'agents': [{'name': 'worker', 'status': status,'tab_id':'tab-worker','pane_id':'pane-worker'}]}}
 
     def paused_sync(self, snapshot):
         ctx = multiprocessing.get_context('fork')
@@ -68,18 +68,17 @@ class ConcurrencyRegressionTests(unittest.TestCase):
         self.seed()
         with patch.object(m, 'herdr_json', return_value={'result': {'tab': {'tab_id': 't'}, 'root_pane': {'pane_id': 'p'}}}) as external:
             with self.assertRaises(SystemExit):
-                m.spawn('worker', '/tmp', name='worker')
+                m.spawn('worker', '/tmp', name='worker',session='relay-test-session')
             external.assert_not_called()
 
     def test_delegate_cli_exit_status(self):
         self.seed()
+        task=approved_test_task(m.STATE)
+        task_file=m.STATE/'task.json'
+        task_file.write_text(__import__('json').dumps(task),encoding='utf-8')
         for phase in ('DONE', 'HUMAN_REVIEW', 'BLOCKED', 'DEEP_REVIEW'):
-            with self.subTest(phase=phase), patch.object(m.sys, 'argv', ['relay', 'delegate', 'worker', '任务']), patch.object(m, 'delegate', return_value={'final_state': phase}), patch('builtins.print'):
-                try:
-                    m.main()
-                    code = 0
-                except SystemExit as error:
-                    code = error.code
+            with self.subTest(phase=phase), patch.object(m.sys, 'argv', ['relay', 'delegate', 'worker','--task-file',str(task_file)]), patch.object(m, 'delegate', return_value={'final_state': phase}), patch('builtins.print'):
+                code=m.main()
                 self.assertEqual(code == 0, phase == 'DONE')
 
     def test_spawn_reservation_and_other_agent_progress_across_processes(self):
@@ -91,15 +90,15 @@ class ConcurrencyRegressionTests(unittest.TestCase):
                 if not resume.wait(8): raise RuntimeError('等待超时')
                 return {'result': {'tab': {'tab_id': 't'}, 'root_pane': {'pane_id': 'p'}}}
             with patch.object(m, 'herdr_json', side_effect=external):
-                m.spawn('worker', '/tmp', name='worker')
+                m.spawn('worker', '/tmp', name='worker',session='relay-test-session')
         process = ctx.Process(target=child)
         process.start()
         self.addCleanup(lambda: process.kill() if process.is_alive() else None)
         self.assertTrue(entered.wait(3))
         with patch.object(m, 'herdr_json', return_value={'result': {'tab': {'tab_id': 't2'}, 'root_pane': {'pane_id': 'p2'}}}) as external:
-            with self.assertRaises(SystemExit): m.spawn('worker', '/tmp', name='worker')
+            with self.assertRaises(SystemExit): m.spawn('worker', '/tmp', name='worker',session='relay-test-session')
             external.assert_not_called()
-            m.spawn('worker', '/tmp', name='other')
+            m.spawn('worker', '/tmp', name='other',session='relay-test-session')
         self.finish(process, resume)
         self.assertEqual(set(m.registry()['agents']), {'worker', 'other'})
         self.assertTrue(all(rec['lifecycle'] == 'IDLE' for rec in m.registry()['agents'].values()))
@@ -111,10 +110,15 @@ class ConcurrencyRegressionTests(unittest.TestCase):
             def child():
                 marker = []
                 def external(cmd, **kwargs):
-                    if cmd[2] == 'prompt': marker.append(cmd[4].splitlines()[0])
+                    if 'prompt' in cmd:
+                        import re
+                        marker.append(re.search(r'\[RELAY TASK [^\]]+\]',cmd[6]).group(0))
                     return subprocess.CompletedProcess(cmd, 0 if success else 1, '\n'.join(marker), '发送失败')
-                with patch.object(m.sys, 'argv', ['relay', 'delegate', 'worker', '任务']), patch.object(m, 'run', side_effect=external), patch.object(m, 'agent_status_obj', return_value={'result': {'status': 'done'}}), patch.object(m, 'review', return_value={'route': 'PASS'}), patch('builtins.print'):
-                    m.main()
+                task=approved_test_task(m.STATE)
+                task_path=m.STATE/'task.json'
+                task_path.write_text(__import__('json').dumps(task),encoding='utf-8')
+                with patch.object(m.sys, 'argv', ['relay', 'delegate', 'worker','--task-file',str(task_path)]), patch.object(m, 'run', side_effect=external), patch.object(m, 'agent_status_obj', return_value={'result': {'status': 'done'}}), patch.object(m, 'review', return_value={'route': 'PASS'}), patch('builtins.print'):
+                    raise SystemExit(m.main())
             process = ctx.Process(target=child)
             process.start()
             process.join(4)
@@ -125,51 +129,22 @@ class ConcurrencyRegressionTests(unittest.TestCase):
             self.assertEqual(process.exitcode, 0 if success else 1)
 
     def test_release_can_retry_failed_close(self):
-        m.save_registry({'agents': {'worker': {'lifecycle': 'IDLE', 'tab_id': 't'}}})
+        seed_agent(tab_id='t')
         with patch.object(m, 'herdr_json', side_effect=RuntimeError('关闭失败')):
             with self.assertRaises(RuntimeError): m.release('worker')
         with patch.object(m, 'herdr_json', return_value={}):
             self.assertEqual(m.release('worker')['lifecycle'], 'STOPPED')
 
     def test_release_cleans_failed_record_without_tab(self):
-        m.save_registry({'agents': {'worker': {'lifecycle': 'FAILED', 'start_error': '创建失败'}}})
+        m.save_registry({'agents': {'worker': {'name':'worker','lifecycle': 'FAILED', 'herdr_session':'relay-test-session','start_error': '创建失败'}}})
         with patch.object(m, 'herdr_json') as herdr:
             result = m.release('worker')
         self.assertEqual(result['lifecycle'], 'STOPPED')
         herdr.assert_not_called()
         self.assertNotEqual(m.registry()['agents']['worker']['lifecycle'], 'STOPPING')
 
-    def test_cross_process_release_refuses_inflight_send_then_finishes_cleanly(self):
-        m.save_registry({'agents': {'worker': {'lifecycle': 'IDLE', 'tab_id': 't'}}})
-        ctx = multiprocessing.get_context('fork')
-        entered, resume = ctx.Event(), ctx.Event()
-
-        def child():
-            def external(*args, **kwargs):
-                entered.set()
-                if not resume.wait(8):
-                    raise RuntimeError('等待发送恢复超时')
-                return subprocess.CompletedProcess([], 0, '', '')
-            with patch.object(m, 'run', side_effect=external):
-                m.send_opaque('worker', '消息')
-
-        process = ctx.Process(target=child)
-        process.start()
-        self.addCleanup(lambda: process.kill() if process.is_alive() else None)
-        self.assertTrue(entered.wait(3))
-        with self.assertRaises(RuntimeError):
-            m.release('worker')
-        self.assertEqual(m.registry()['agents']['worker']['lifecycle'], 'IDLE')
-        resume.set()
-        process.join(4)
-        self.assertFalse(process.is_alive(), '发送子进程未退出')
-        self.assertEqual(process.exitcode, 0)
-        self.assertNotIn('operation', m.registry()['agents']['worker'])
-        with patch.object(m, 'herdr_json', return_value={}):
-            self.assertEqual(m.release('worker')['lifecycle'], 'STOPPED')
-
-    def test_cross_process_release_refuses_inflight_dispatch(self):
-        m.save_registry({'agents': {'worker': {'lifecycle': 'IDLE', 'tab_id': 't'}}})
+    def test_cross_process_status_and_release_preserve_inflight_dispatch(self):
+        seed_agent(tab_id='t')
         ctx = multiprocessing.get_context('fork')
         entered, resume = ctx.Event(), ctx.Event()
 
@@ -180,7 +155,37 @@ class ConcurrencyRegressionTests(unittest.TestCase):
                     raise RuntimeError('等待派发恢复超时')
                 return subprocess.CompletedProcess([], 0, '', '')
             with patch.object(m, 'run', side_effect=external):
-                m.dispatch_opaque('worker', '任务')
+                m.dispatch_opaque('worker', approved_test_task(m.STATE))
+
+        process = ctx.Process(target=child)
+        process.start()
+        self.addCleanup(lambda: process.kill() if process.is_alive() else None)
+        self.assertTrue(entered.wait(3))
+        with self.assertRaises(RuntimeError):
+            m.release('worker')
+        status=m.send_opaque('worker', '{"control":"status"}')
+        self.assertEqual(status['status'],'BUSY')
+        self.assertEqual(m.registry()['agents']['worker']['lifecycle'], 'BUSY')
+        resume.set()
+        process.join(4)
+        self.assertFalse(process.is_alive(), '发送子进程未退出')
+        self.assertEqual(process.exitcode, 0)
+        self.assertNotIn('operation', m.registry()['agents']['worker'])
+        with self.assertRaises(RuntimeError): m.release('worker')
+
+    def test_cross_process_release_refuses_inflight_dispatch(self):
+        seed_agent(tab_id='t')
+        ctx = multiprocessing.get_context('fork')
+        entered, resume = ctx.Event(), ctx.Event()
+
+        def child():
+            def external(*args, **kwargs):
+                entered.set()
+                if not resume.wait(8):
+                    raise RuntimeError('等待派发恢复超时')
+                return subprocess.CompletedProcess([], 0, '', '')
+            with patch.object(m, 'run', side_effect=external):
+                m.dispatch_opaque('worker', approved_test_task(m.STATE))
 
         process = ctx.Process(target=child)
         process.start()

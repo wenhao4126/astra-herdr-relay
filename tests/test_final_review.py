@@ -96,9 +96,15 @@ class FinalReviewProviderTests(unittest.TestCase):
         self.assertNotIn(secret, json.dumps(result))
 
     def test_nonstandalone_repo_fails_before_ocr(self):
-        with patch.object(m, "run") as run:
-            result = m.run_ocr("relay-test", "任务", Path(__file__).parents[1])
+        with tempfile.TemporaryDirectory() as temp:
+            parent = Path(temp) / "父仓库"
+            child = parent / "子项目"
+            child.mkdir(parents=True)
+            subprocess.run(["git", "init", "-q", str(parent)], check=True)
+            with patch.object(m, "run") as run:
+                result = m.run_ocr("relay-test", "任务", child)
         self.assertEqual(result["status"], "ERROR")
+        self.assertIn("独立 Git 仓库", result["summary"])
         run.assert_not_called()
 
     def test_ready_state_requires_four_pass_artifacts(self):

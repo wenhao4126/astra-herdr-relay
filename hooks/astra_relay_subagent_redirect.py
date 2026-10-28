@@ -4,13 +4,14 @@ Codex 多代理工具的 PreToolUse 桥接。
 转发 Astra 已决定的创建或消息请求至 Relay，并阻断原生内部工具，
 避免创建隐藏子代理。
 """
-import fcntl, hashlib, json, os, re, subprocess, sys, tempfile, uuid
+import fcntl, hashlib, json, os, re, subprocess, sys, tempfile
 from contextlib import contextmanager
 from pathlib import Path
 
 RELAY=os.path.expanduser("~/.local/bin/astra-relay")
 STATE=Path.home()/".local/state/astra-herdr-relay"
 MAP=STATE/"hook-agent-map.json"
+INNER_COMMAND_TIMEOUT_SECONDS=180
 
 def load_map():
     try: mapping=json.loads(MAP.read_text())
@@ -79,9 +80,13 @@ def safe_name(inp,role,event=None):
     # 身份字段属于顶层 Hook 事件，不能从工具参数中读取。
     identity_source=event if event is not None else inp
     identity="|".join(str(identity_source.get(key) or "") for key in ("session_id", "turn_id", "tool_use_id"))
-    stable=hashlib.sha256(identity.encode()).hexdigest()[:6] if identity else "anon"
-    unique=uuid.uuid4().hex[:6]
-    return (f"codex-{raw[:13].rstrip('-')}-{stable}{unique}")[:32].rstrip("-")
+    stable=hashlib.sha256(identity.encode()).hexdigest()[:12] if identity else "anonymous000"
+    return (f"codex-{raw[:13].rstrip('-')}-{stable}")[:32].rstrip("-")
+def request_id_for(event,task):
+    identity="|".join(str(event.get(key) or "") for key in ("session_id","turn_id","tool_use_id"))
+    if not identity.strip("|"):
+        identity=json.dumps(task,ensure_ascii=False,sort_keys=True,separators=(",",":"))
+    return "hook-"+hashlib.sha256(identity.encode("utf-8")).hexdigest()[:32]
 def tmptext(text):
     f=tempfile.NamedTemporaryFile("w",encoding="utf-8",delete=False,prefix="astra-relay-hook-",suffix=".txt")
     f.write(text); f.close(); return f.name
@@ -100,32 +105,50 @@ try:
         raise SystemExit(0)
 
     if tool=="spawn_agent":
-        message=inp.get("message")
-        if not isinstance(message,str) or not message:
-            deny("RELAY_REDIRECT_FAILED: spawn_agent had no plain-text message; native spawn blocked to avoid a hidden agent.")
+        package=inp.get("task_package")
+        if package is None:
+            message=inp.get("message")
+            if type(message) is str:
+                try: package=json.loads(message)
+                except ValueError: package=None
+        elif type(package) is str:
+            try: package=json.loads(package)
+            except ValueError: package=None
+        if type(package) is not dict:
+            deny("TASK_PACKAGE_REQUIRED: spawn_agent.message 必须是 schema_version=1 的任务包 JSON；普通自由文本不会派发。")
+            raise SystemExit(0)
+        event_cwd=Path(cwd).resolve(strict=True)
+        if not event_cwd.is_dir() or package.get("working_directory")!=str(event_cwd):
+            deny("WORKING_DIRECTORY_INVALID: 任务包 working_directory 必须等于 Hook 当前真实目录；独立 CLI dispatch-task --task-file 可明确使用其他真实目录。")
             raise SystemExit(0)
         role=role_for(inp); requested=safe_name(inp,role,ev)
-        cmd=[RELAY,"spawn","--role",role,"--cwd",cwd,"--name",requested]
-        if parent: cmd += ["--parent-task-id",parent]
-        r=run(cmd,timeout=125)
-        if r.returncode:
-            # 创建可能已产生资源，失败后禁止自动重试。
-            deny(f"RELAY_REDIRECT_FAILED: requested_agent={requested} "+(r.stderr or r.stdout)[-1200:]); raise SystemExit(0)
-        rec=json.loads(r.stdout); agent=rec["name"]
-        fp=tmptext(message)
+        request_id=request_id_for(ev,package)
+        fp=tmptext(json.dumps(package,ensure_ascii=False,separators=(",",":")))
         try:
-            d=run([RELAY,"dispatch-opaque",agent,"--prompt-file",fp]+(["--parent-task-id",parent] if parent else []))
+            cmd=[RELAY,"dispatch-task","--task-file",fp,"--role",role,"--name",requested,
+                 "--request-id",request_id]
+            if parent: cmd += ["--parent-task-id",parent]
+            model=inp.get("model")
+            reasoning=inp.get("reasoning_effort")
+            if "model" in inp and (type(model) is not str or not model.strip()):
+                deny("MODEL_CONFIG_INVALID: model 必须是非空字符串；未创建代理。")
+                raise SystemExit(0)
+            if "reasoning_effort" in inp and (type(reasoning) is not str or reasoning not in {"low","medium","high","xhigh","max"}):
+                deny("MODEL_CONFIG_INVALID: reasoning_effort 必须是 low/medium/high/xhigh/max；未创建代理。")
+                raise SystemExit(0)
+            if type(model) is str and model: cmd += ["--model",model]
+            if type(reasoning) is str and reasoning: cmd += ["--reasoning",reasoning]
+            d=run(cmd,timeout=INNER_COMMAND_TIMEOUT_SECONDS)
         finally:
             try: os.unlink(fp)
             except OSError: pass
-        if d.returncode:
-            deny(f"RELAY_REDIRECT_PARTIAL: Herdr agent {agent} was created but task dispatch failed: {(d.stderr or d.stdout)[-900:]}")
+        try: dispatched=json.loads(d.stdout)
+        except ValueError: dispatched={"ok":False,"error":{"code":"RELAY_OUTPUT_INVALID","message":d.stderr or d.stdout}}
+        if d.returncode or dispatched.get("accepted") is not True:
+            err=dispatched.get("error",{})
+            deny(f"RELAY_REDIRECT_FAILED: code={err.get('code','DISPATCH_NOT_ACCEPTED')} requested_agent={requested} {err.get('message',d.stderr or d.stdout)[-900:]}")
             raise SystemExit(0)
-        dispatched=json.loads(d.stdout)
-        # 即使旧版命令错误地返回零，也必须核实任务确实被接收。
-        if dispatched.get("accepted") is not True:
-            deny(f"RELAY_REDIRECT_PARTIAL: Herdr agent {agent} was created but task dispatch was not accepted: {str(dispatched.get('error', 'missing acceptance'))[-900:]}")
-            raise SystemExit(0)
+        agent=dispatched.get("agent")
         task=dispatched.get("task_id")
         if not isinstance(task,str) or not re.fullmatch(r"relay-[a-zA-Z0-9_-]+",task):
             deny(f"RELAY_REDIRECT_PARTIAL: Herdr agent {agent} was created and dispatch was accepted, but task_id is invalid: {task!r}")
@@ -137,22 +160,29 @@ try:
         except Exception as exc:
             deny(f"RELAY_REDIRECT_PARTIAL: Herdr agent {agent} was created and task {task} was accepted, but mapping save failed: {str(exc)[-900:]}")
             raise SystemExit(0)
-        deny(f"RELAY_REDIRECT_OK: native internal spawn was blocked. Astra's original message was forwarded unchanged to visible Herdr agent '{agent}' via Relay. relay_task_id={task}. Use Relay-managed messaging/status/release for this agent.")
+        deny(f"RELAY_REDIRECT_OK: native internal spawn was blocked; approved task package was dispatched to visible Herdr agent '{agent}'. relay_task_id={task} task_sha256={dispatched.get('task_sha256')}.")
         raise SystemExit(0)
 
     if tool in {"send_message","followup_task"}:
         target=str(inp.get("target") or "")
         agent=resolve(sid,target)
         message=inp.get("message")
-        if not target or not isinstance(message,str):
-            deny("RELAY_REDIRECT_FAILED: missing target/message."); raise SystemExit(0)
+        if not target or type(message) is not str:
+            deny("TASK_PACKAGE_REQUIRED: 消息必须是任务包 JSON，或显式 status/stop 控制对象。")
+            raise SystemExit(0)
+        request_id=request_id_for(ev,message)
         fp=tmptext(message)
-        try: r=run([RELAY,"send-opaque",agent,"--message-file",fp])
+        try: r=run([RELAY,"send-opaque",agent,"--message-file",fp,"--request-id",request_id])
         finally:
             try: os.unlink(fp)
             except OSError: pass
-        deny(("RELAY_REDIRECT_OK: message forwarded unchanged to "+agent) if r.returncode==0
-             else "RELAY_REDIRECT_FAILED: "+(r.stderr or r.stdout)[-1000:])
+        try: response=json.loads(r.stdout)
+        except ValueError: response={"ok":False,"error":{"code":"RELAY_OUTPUT_INVALID","message":r.stderr or r.stdout}}
+        if r.returncode or response.get("accepted") is False or response.get("ok") is False:
+            error=response.get("error",{})
+            deny(f"RELAY_REDIRECT_FAILED: code={error.get('code','SEND_REJECTED')} {error.get('message',r.stderr or r.stdout)[-1000:]}")
+        else:
+            deny("RELAY_REDIRECT_OK: "+json.dumps(response,ensure_ascii=False,separators=(",",":"))[:900])
         raise SystemExit(0)
 
     if tool=="close_agent":
@@ -167,8 +197,8 @@ try:
         deny("RELAY_MANAGED_AGENT: native internal agent-control tool blocked. Query/control the Relay-managed Herdr agent through astra-relay instead.")
         raise SystemExit(0)
 
-    # 允许不属于匹配范围的调用。
-    print(json.dumps({"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow"}}))
+    # 对不属于当前 matcher 的正常调用不输出无效的 allow 结构。
+    raise SystemExit(0)
 except Exception as e:
     # 异常时阻断原生创建，报告请求名称供人工核实。
     deny(f"RELAY_HOOK_ERROR: requested_agent={locals().get('requested', '未创建')} "+str(e)[:1000])

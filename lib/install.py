@@ -22,6 +22,8 @@ REQUIRED_FILES = (
     "install.sh",
     "lib/install.py",
     "lib/relay.py",
+    "lib/task_contract.py",
+    "lib/gates.py",
     "hooks/astra_relay_subagent_redirect.py",
     "hooks/hooks.fragment.json",
     "systemd/astra-herdr-relay.service",
@@ -280,6 +282,8 @@ def install(source, root, *, runner=subprocess.run, proc_root=Path("/proc"), che
     agents = codex / "AGENTS.md"
     targets = {library / "relay.py": source / "lib/relay.py",
                library / "install.py": source / "lib/install.py",
+               library / "task_contract.py": source / "lib/task_contract.py",
+               library / "gates.py": source / "lib/gates.py",
                library / "hooks/astra_relay_subagent_redirect.py": source / "hooks/astra_relay_subagent_redirect.py"}
     for name in ENTRYPOINTS:
         targets[binary / name] = source / "bin" / name

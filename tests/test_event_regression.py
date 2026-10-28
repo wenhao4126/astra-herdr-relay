@@ -4,30 +4,42 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from test_relay import m
+from test_relay import approved_test_task, m, seed_agent
 
 
 class EventRegressionTests(unittest.TestCase):
     def test_async_dispatch_omits_wait_only_timeout(self):
-        m.save_registry({"agents": {"test-worker": {"lifecycle": "IDLE"}}})
+        seed_agent("test-worker")
+        task=approved_test_task(m.STATE,model=m.TYPESAFE_MODEL)
         with patch.object(m, "run") as popen:
             popen.return_value.returncode = 0
-            result = m.dispatch_opaque("test-worker", "原始任务")
+            result = m.dispatch_opaque("test-worker", task)
         self.assertTrue(result["accepted"])
         command = popen.call_args.args[0]
         self.assertNotIn("--timeout", command)
         self.assertNotIn("--wait", command)
-        self.assertNotIn(f"[RELAY FINISHED {result['task_id']}]", command[4])
-        self.assertTrue(command[4].endswith("\n原始任务"))
+        self.assertIn("--session",command)
+        self.assertIn("[RELAY FINISHED "+result["task_id"]+"]",command[6])
+        self.assertIn('"schema_version":1',command[6])
 
     def test_followup_omits_wait_only_timeout(self):
-        m.save_registry({"agents": {"test-worker": {"lifecycle": "IDLE"}}})
+        seed_agent("test-worker")
+        task=approved_test_task(m.STATE,model=m.TYPESAFE_MODEL)
         with patch.object(m, "run") as run:
             run.return_value.returncode = 0
-            result = m.send_opaque("test-worker", "原始消息")
+            result = m.send_opaque("test-worker", json.dumps(task))
         self.assertTrue(result["accepted"])
-        self.assertEqual(run.call_args.args[0],
-                         ["herdr", "agent", "prompt", "test-worker", "原始消息"])
+        command=run.call_args.args[0]
+        self.assertEqual(command[:6], ["herdr","--session","relay-test-session","agent","prompt","test-worker"])
+        self.assertIn('"schema_version":1',command[6])
+
+    def test_explicit_status_control_never_sends_free_text(self):
+        seed_agent("test-worker")
+        with patch.object(m,"run") as external:
+            result=m.send_opaque("test-worker",' {"control":"status"} ')
+        self.assertEqual(result["control"],"status")
+        self.assertEqual(result["status"],"IDLE")
+        external.assert_not_called()
 
     def setUp(self):
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
@@ -38,6 +50,7 @@ class EventRegressionTests(unittest.TestCase):
             "LOCKS": root / "locks",
         }.items():
             self.enterContext(patch.object(m, key, value))
+        self.enterContext(patch.object(m,"HERDR_SESSION","relay-test-session"))
 
     def test_spawn_records_named_agent_and_reaches_idle(self):
         # 隔离外部进程，验证创建流程确实能越过日志记录并启动代理。
@@ -328,12 +341,13 @@ class EventRegressionTests(unittest.TestCase):
         with patch("sys.argv", ["astra-relay", "spawn", "--role", "worker", "--model", "gpt-6-luna"]), \
              patch.object(m, "spawn", return_value={"name": "test-worker"}) as spawn:
             m.main()
-        self.assertEqual(spawn.call_args.args[-1], "gpt-6-luna")
+        self.assertEqual(spawn.call_args.args[5], "gpt-6-luna")
 
     def test_approved_claude_start_can_become_ready(self):
         m.save_registry({"agents": {"claude-reviewer": {
             "name": "claude-reviewer", "role": "reviewer", "kind": "claude",
             "lifecycle": "BLOCKED", "tab_id": "test-tab", "pane_id": "test-pane",
+            "herdr_session":"relay-test-session",
         }}})
         snapshot={"result": {"agents": [{"name": "claude-reviewer", "tab_id": "test-tab",
                                          "pane_id": "test-pane", "agent_status": "idle"}]}}
@@ -345,9 +359,10 @@ class EventRegressionTests(unittest.TestCase):
                              ["herdr", "--session", "relay-v0.50", "tab", "list"])
 
     def test_sensor_logs_named_agent_without_calling_jev(self):
-        m.save_registry({"agents": {"test-worker": {"name": "test-worker"}}})
+        seed_agent("test-worker")
         with patch.object(m, "agent_status_obj", return_value={
-            "result": {"agent": {"status": "done"}}
+            "result": {"agent": {"name":"test-worker", "tab_id":"tab-test-worker",
+                                   "pane_id":"pane-test-worker", "status": "done"}}
         }), patch.object(m, "jev_call") as jev:
             result = m.sensor("test-worker")
         self.assertEqual(result["semantic_status"], "COMPLETED")

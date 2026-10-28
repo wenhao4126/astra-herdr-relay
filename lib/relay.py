@@ -6,6 +6,11 @@ import argparse, json, os, re, subprocess, sys, time, urllib.request, urllib.err
 from pathlib import Path
 from typing import Any
 
+LIB_DIR=Path(__file__).resolve().parent
+if str(LIB_DIR) not in sys.path: sys.path.insert(0,str(LIB_DIR))
+import gates
+from task_contract import TaskContractError, canonical_digest, canonical_json, validate_task
+
 VERSION="0.5.0"
 HOME=Path.home()
 STATE=HOME/".local/state/astra-herdr-relay"
@@ -15,15 +20,28 @@ EVENTS=STATE/"events.jsonl"
 SEMANTIC=STATE/"semantic"
 REVIEWS=STATE/"reviews"
 LOCKS=STATE/"locks"
+REQUESTS=STATE/"requests"
 CFG=HOME/".config/astra-herdr-relay"
 ALLOWED_ROLES={"worker","fixer","reviewer","tester","auditor"}
 MAX_REWORKS=int(os.getenv("ASTRA_RELAY_MAX_REWORKS","2"))
 MAX_ACTIVE=int(os.getenv("ASTRA_RELAY_MAX_ACTIVE_AGENTS","8"))
 HERDR_WORKSPACE=os.getenv("ASTRA_HERDR_WORKSPACE_ID","").strip()
-HERDR_SESSION=os.getenv("ASTRA_HERDR_SESSION","").strip()
-TYPESAFE_URL=os.getenv("TYPESAFE_URL","https://api.typesafe.ai/v1/systemone")
-TYPESAFE_MODEL=os.getenv("TYPESAFE_MODEL","jev-latest")
-TYPESAFE_TIMEOUT=float(os.getenv("TYPESAFE_TIMEOUT_SECONDS","15"))
+def _configured_value(name,default=""):
+    if name in os.environ:
+        return os.environ[name].strip()
+    for file in (CFG/"relay.env",CFG/"secret.env"):
+        try: lines=file.read_text(encoding="utf-8").splitlines()
+        except OSError: continue
+        for line in lines:
+            match=re.fullmatch(r"\s*([A-Za-z_][A-Za-z0-9_]*)=(.*)\s*",line)
+            if match and match.group(1)==name:
+                return match.group(2).strip().strip("\"'")
+    return default
+
+HERDR_SESSION=_configured_value("ASTRA_HERDR_SESSION")
+TYPESAFE_URL=_configured_value("TYPESAFE_URL","https://api.typesafe.ai/v1/systemone")
+TYPESAFE_MODEL=_configured_value("TYPESAFE_MODEL","jev-latest")
+TYPESAFE_TIMEOUT=float(_configured_value("TYPESAFE_TIMEOUT_SECONDS","15"))
 SENSOR_MIN_INTERVAL=float(os.getenv("ASTRA_JEV_SENSOR_MIN_INTERVAL","15"))
 STARTUP_GRACE=float(os.getenv("ASTRA_RELAY_STARTUP_GRACE_SECONDS","45"))
 # Final Review Gate is opt-in so an upgrade cannot change the v0.5.0 path.
@@ -33,7 +51,9 @@ OCR_TIMEOUT=float(os.getenv("ASTRA_RELAY_OCR_TIMEOUT_SECONDS","300"))
 FINAL_REVIEW_MAX_REWORKS=int(os.getenv("ASTRA_RELAY_FINAL_REVIEW_MAX_REWORKS",str(MAX_REWORKS)))
 
 def ensure():
-    for p in [STATE,TASKS,SEMANTIC,REVIEWS,LOCKS]: p.mkdir(parents=True,exist_ok=True)
+    global REQUESTS
+    REQUESTS=STATE/"requests"
+    for p in [STATE,TASKS,SEMANTIC,REVIEWS,LOCKS,REQUESTS]: p.mkdir(parents=True,exist_ok=True)
 
 def now(): return time.time()
 def write_json(p:Path,obj:Any):
@@ -53,17 +73,79 @@ def event(event_name,**kw):
     with EVENTS.open("a",encoding="utf-8") as f:
         f.write(json.dumps({"ts":now(),"event":event_name,**kw},ensure_ascii=False)+"\n")
 
+def _task_digest(task):
+    if type(task) is not dict:
+        raise gates.GateError("TASK_PACKAGE_REQUIRED","派发必须提供结构化任务包")
+    return canonical_digest(task)
+
+def _require_task_approval(task):
+    digest=_task_digest(task)
+    gates.require_approval(task,TYPESAFE_MODEL,STATE)
+    return digest
+
+def _load_task_file(filename):
+    try: value=json.loads(Path(filename).read_text(encoding="utf-8"))
+    except (OSError,ValueError) as exc:
+        raise gates.GateError("TASK_PACKAGE_INVALID","无法读取合法 JSON 任务包") from exc
+    try: return validate_task(value)
+    except TaskContractError as exc:
+        raise gates.GateError(exc.code,str(exc)) from exc
+
+def _structured_error(exc):
+    return {"ok":False,"error":{"code":getattr(exc,"code","RELAY_ERROR"),"message":str(exc)}}
+
+def _request_id(value=None):
+    value=value or ("relay-"+uuid.uuid4().hex)
+    if type(value) is not str or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,95}",value):
+        raise gates.GateError("REQUEST_ID_INVALID","request_id 格式无效")
+    return value
+
+@contextmanager
+def request_claim(request_id,operation,task_sha256,target):
+    ensure()
+    request_id=_request_id(request_id)
+    path=REQUESTS/(request_id+".json")
+    lock_path=REQUESTS/(request_id+".lock")
+    with lock_path.open("a",encoding="utf-8") as lock:
+        os.chmod(lock_path,0o600)
+        fcntl.flock(lock,fcntl.LOCK_EX)
+        existing=read_json(path,None)
+        if existing is not None:
+            if any(existing.get(key)!=value for key,value in {
+                "operation":operation,"task_sha256":task_sha256,"target":target}.items()):
+                raise gates.GateError("REQUEST_ID_CONFLICT","request_id 已绑定其他任务或目标")
+            if existing.get("status") in {"PREPARED","CREATING","DISPATCHING","WAITING"}:
+                existing.update(status="UNKNOWN",error_code="REQUEST_INTERRUPTED",cached=True)
+                write_json(path,existing)
+            else:
+                existing["cached"]=True
+            yield {"claimed":False,"record":existing,"path":path}
+            return
+        record={"request_id":request_id,"operation":operation,"task_sha256":task_sha256,
+                "target":target,"status":"PREPARED","created_at":now()}
+        write_json(path,record)
+        yield {"claimed":True,"record":record,"path":path}
+
+def finish_request(claim,status,**fields):
+    record=dict(claim["record"])
+    record.update(status=status,updated_at=now(),**fields)
+    write_json(claim["path"],record)
+    return record
+
 def run(cmd,timeout=60,check=True):
     p=subprocess.run(cmd,text=True,capture_output=True,timeout=timeout)
     if check and p.returncode:
         raise RuntimeError(f"command failed rc={p.returncode}: {' '.join(cmd)}\n{p.stderr.strip() or p.stdout.strip()}")
     return p
 
-def herdr_command(*args):
-    return ["herdr",*(["--session",HERDR_SESSION] if HERDR_SESSION else []),*args]
+def herdr_command(*args,session=None):
+    session=HERDR_SESSION if session is None else session
+    if type(session) is not str or not session.strip():
+        raise gates.GateError("HERDR_SESSION_REQUIRED","必须显式指定 Herdr session")
+    return ["herdr","--session",session,*args]
 
-def herdr_json(args,timeout=60):
-    p=run(herdr_command(*args),timeout=timeout,check=False)
+def herdr_json(args,timeout=60,session=None):
+    p=run(herdr_command(*args,session=session),timeout=timeout,check=False)
     # 失败响应优先读取 stderr；成功结果仍从 stdout 读取。
     channels=[p.stderr,p.stdout] if p.returncode else [p.stdout]
     obj=None
@@ -122,10 +204,10 @@ def update_agent(name,expected,changes):
 def live_count(r):
     return sum(1 for a in r["agents"].values() if a.get("lifecycle") not in {"STOPPED","REMOVED","FAILED"})
 
-def focused_tab_id():
+def focused_tab_id(session=None):
     """读取 Herdr 当前焦点标签；无法确定时返回 None。"""
     try:
-        obj=herdr_json(["tab","list"])
+        obj=herdr_json(["tab","list"],session=session)
         result=obj.get("result",{})
         tabs=result.get("tabs",[]) if isinstance(result,dict) else []
         for tab in tabs:
@@ -136,9 +218,21 @@ def focused_tab_id():
     except Exception:
         return None
 
-def preserve_focus(previous,created_tab):
-    if previous and created_tab and focused_tab_id()==created_tab:
-        herdr_json(["tab","focus",previous])
+def preserve_focus(previous,created_tab,session=None):
+    if previous and created_tab and focused_tab_id(session)==created_tab:
+        herdr_json(["tab","focus",previous],session=session)
+
+def agent_session(name,record=None):
+    record=record or registry()["agents"].get(name)
+    session=record.get("herdr_session") if isinstance(record,dict) else None
+    if type(session) is not str or not session.strip():
+        raise gates.GateError("HERDR_SESSION_REQUIRED",f"代理 {name} 未绑定明确的 Herdr session")
+    return session
+
+def require_agent_task_cwd(record,task):
+    cwd=record.get("cwd") if isinstance(record,dict) else None
+    if type(cwd) is not str or cwd!=task.get("working_directory"):
+        raise gates.GateError("TASK_WORKING_DIRECTORY_MISMATCH","代理 cwd 必须与已验证任务包 working_directory 一致")
 
 def unique_name(role,r=None):
     if r is None: r=registry()
@@ -148,60 +242,160 @@ def unique_name(role,r=None):
         if n not in r["agents"] or r["agents"][n].get("lifecycle") in {"STOPPED","REMOVED","FAILED"}: return n
         i+=1
 
-def spawn(role,cwd,name=None,parent_task_id=None,kind="codex",model=None):
+def spawn(role,cwd,name=None,parent_task_id=None,kind="codex",model=None,reasoning=None,session=None,request_id=None):
     if role not in ALLOWED_ROLES: raise SystemExit(f"invalid role: {role}")
     if model is not None and (kind not in {"codex","claude"} or not model.strip()):
         raise SystemExit(f"model requires codex/claude kind and a non-empty value: {kind}")
-    cwd=str(Path(cwd).expanduser().resolve())
-    with registry_transaction() as r:
-        if live_count(r)>=MAX_ACTIVE: raise SystemExit(f"RESOURCE_LIMIT active_agents={live_count(r)} max_agents={MAX_ACTIVE}")
-        name=name or unique_name(role,r)
-        if not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}",name): raise SystemExit("invalid Herdr agent name")
-        old=r["agents"].get(name)
-        if old and old.get("lifecycle") not in {"STOPPED","REMOVED","FAILED"}:
-            raise SystemExit(f"agent already active: {name}")
-        if (LOCKS/f"{name}.lock").exists(): raise SystemExit(f"AGENT_BUSY_LOCKED agent={name}")
-        rec={"name":name,"role":role,"kind":kind,"model":model,"cwd":cwd,"parent_task_id":parent_task_id,
-             "lifecycle":"CREATING","created_at":now(),"last_seen":now()}
-        r["agents"][name]=rec
-    previous_focus=focused_tab_id()
-    cmd=["tab","create"]
-    if HERDR_WORKSPACE: cmd += ["--workspace",HERDR_WORKSPACE]
-    cmd += ["--cwd",cwd,"--label",name,"--no-focus"]
-    try:
-        created=herdr_json(cmd)
-        tab_id=created["result"]["tab"]["tab_id"]; pane_id=created["result"]["root_pane"]["pane_id"]
-        rec=update_agent(name,rec,{"tab_id":tab_id,"pane_id":pane_id})
-    except Exception as e:
-        update_agent(name,rec,{"lifecycle":"FAILED","start_error":str(e)})
-        raise
-    event("agent_creating",**rec)
-    try:
-        start_cmd=["agent","start",name,"--kind",kind,"--pane",pane_id,"--timeout","30000"]
-        if model is not None: start_cmd += ["--","--model",model]
-        herdr_json(start_cmd,timeout=40)
-    except Exception as start_error:
-        if "agent_not_ready" in str(start_error):
-            rec=update_agent(name,rec,{"lifecycle":"BLOCKED","start_error":"agent_not_ready"})
-            event("agent_start_blocked",agent=name,tab_id=tab_id,pane_id=pane_id)
-            preserve_focus(previous_focus,tab_id)
-            return rec
-        # Transactional rollback: a failed start must not leave an orphan Herdr tab.
-        rollback_error=None
+    if reasoning is not None and (kind!="codex" or model is None or
+                                  type(reasoning) is not str or reasoning not in {"low","medium","high","xhigh","max"}):
+        raise gates.GateError("MODEL_CONFIG_INVALID","reasoning 仅支持 Codex 显式模型配置及 low/medium/high/xhigh/max")
+    if type(cwd) is not str or not cwd or not Path(cwd).is_absolute():
+        raise gates.GateError("WORKING_DIRECTORY_INVALID","cwd 必须是绝对目录")
+    try: resolved=Path(cwd).resolve(strict=True)
+    except OSError as exc: raise gates.GateError("WORKING_DIRECTORY_INVALID","cwd 必须存在") from exc
+    if not resolved.is_dir() or str(resolved)!=cwd:
+        raise gates.GateError("WORKING_DIRECTORY_INVALID","cwd 必须是规范化的真实目录")
+    cwd=str(resolved)
+    session=HERDR_SESSION if session is None else session
+    if type(session) is not str or not session.strip():
+        raise gates.GateError("HERDR_SESSION_REQUIRED","必须显式指定 Herdr session")
+    name=name or unique_name(role)
+    if not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}",name): raise SystemExit("invalid Herdr agent name")
+    request_id=_request_id(request_id)
+    with request_claim(request_id,"CREATE_AGENT","",name) as claim:
+        if not claim["claimed"]:
+            previous=claim["record"]
+            rec=registry()["agents"].get(name)
+            def replay_state(status,error_code):
+                finish_request(claim,status,error_code=error_code)
+                status_value="REQUEST_STALE_INSTANCE" if status=="STALE" else "UNKNOWN"
+                return {"name":name,"lifecycle":status,"status":status_value,
+                        "request_id":request_id,"error_code":error_code,"cached":True}
+            if previous.get("status")=="STALE":
+                return replay_state("STALE",previous.get("error_code","REQUEST_STALE_INSTANCE"))
+            if previous.get("status")=="UNKNOWN":
+                return replay_state("UNKNOWN",previous.get("error_code","CREATE_STATUS_UNKNOWN"))
+            if previous.get("status") in {"CREATED","BLOCKED"}:
+                expected=previous.get("instance")
+                if type(expected) is not dict or any(expected.get(key) is None for key in
+                       ("herdr_session","tab_id","pane_id","created_at")):
+                    return replay_state("UNKNOWN","CREATE_REPLAY_IDENTITY_UNKNOWN")
+                if rec is None or rec.get("lifecycle") in {"STOPPED","REMOVED","FAILED","STALE"}:
+                    return replay_state("STALE","REQUEST_STALE_INSTANCE")
+                if rec.get("lifecycle")=="UNKNOWN":
+                    return replay_state("UNKNOWN","CREATE_STATUS_UNKNOWN")
+                if (rec.get("request_id")!=request_id or rec.get("herdr_session")!=session or
+                    agent_instance(rec)!=expected):
+                    return replay_state("STALE","REQUEST_STALE_INSTANCE")
+                try:
+                    observed=herdr_json(["agent","get",name],timeout=15,session=session)
+                except Exception:
+                    return replay_state("UNKNOWN","CREATE_STATUS_UNKNOWN")
+                error=observed.get("error") if isinstance(observed,dict) else None
+                if isinstance(error,dict) and error.get("code")=="agent_not_found":
+                    return replay_state("STALE","REQUEST_STALE_INSTANCE")
+                if error:
+                    return replay_state("UNKNOWN","CREATE_STATUS_UNKNOWN")
+                observed_agent=extract_agent(observed)
+                if (type(observed_agent) is not dict or any(
+                        type(observed_agent.get(key)) is not str or not observed_agent[key].strip()
+                        for key in ("name","tab_id","pane_id"))):
+                    return replay_state("UNKNOWN","CREATE_STATUS_UNKNOWN")
+                if not same_agent_instance(rec,observed_agent,name,session):
+                    return replay_state("STALE","REQUEST_STALE_INSTANCE")
+                runtime=runtime_status(observed_agent)
+                if runtime in {"stopped","removed","failed"}:
+                    return replay_state("STALE","REQUEST_STALE_INSTANCE")
+                if runtime=="unknown":
+                    return replay_state("UNKNOWN","CREATE_STATUS_UNKNOWN")
+                return {**rec,"request_id":request_id,"cached":True}
+            return {"name":name,"lifecycle":"UNKNOWN","status":"UNKNOWN","request_id":request_id,
+                    "error_code":previous.get("error_code","REQUEST_NOT_REPLAYED")}
+        finish_request(claim,"CREATING",herdr_session=session)
+        with registry_transaction() as r:
+            if live_count(r)>=MAX_ACTIVE: raise SystemExit(f"RESOURCE_LIMIT active_agents={live_count(r)} max_agents={MAX_ACTIVE}")
+            old=r["agents"].get(name)
+            if old and old.get("herdr_session")!=session:
+                raise gates.GateError("AGENT_NAME_SESSION_CONFLICT","同名 Relay 代理已绑定其他 Herdr session")
+            if old and old.get("lifecycle") not in {"STOPPED","REMOVED","FAILED"}:
+                raise SystemExit(f"agent already active: {name}")
+            if (LOCKS/f"{name}.lock").exists(): raise SystemExit(f"AGENT_BUSY_LOCKED agent={name}")
+            rec={"name":name,"role":role,"kind":kind,"model":model,"reasoning":reasoning,
+                 "cwd":cwd,"herdr_session":session,"parent_task_id":parent_task_id,
+                 "request_id":request_id,"lifecycle":"CREATING","created_at":now(),"last_seen":now()}
+            r["agents"][name]=rec
+        previous_focus=focused_tab_id(session)
+        cmd=["tab","create"]
+        if HERDR_WORKSPACE: cmd += ["--workspace",HERDR_WORKSPACE]
+        cmd += ["--cwd",cwd,"--label",name,"--no-focus"]
         try:
-            herdr_json(["tab","close",tab_id],timeout=15)
-        except Exception as e:
-            rollback_error=str(e)
-        changes={"lifecycle":"FAILED","failed_at":now(),"start_error":str(start_error)}
-        if rollback_error: changes["rollback_error"]=rollback_error
-        rec=update_agent(name,rec,changes)
-        event("agent_start_failed",agent=name,tab_id=tab_id,pane_id=pane_id,rollback_error=rollback_error)
-        preserve_focus(previous_focus,tab_id)
-        raise
-    rec=update_agent(name,rec,{"lifecycle":"IDLE","ready_at":now()})
-    event("agent_ready",agent=name,role=role,tab_id=tab_id,pane_id=pane_id,parent_task_id=parent_task_id)
-    preserve_focus(previous_focus,tab_id)
-    return rec
+            created=herdr_json(cmd,session=session)
+            result=created.get("result") if type(created) is dict else None
+            tab=result.get("tab",{}) if type(result) is dict else {}
+            pane=result.get("root_pane",{}) if type(result) is dict else {}
+            tab_id=tab.get("tab_id") if type(tab) is dict else None
+            pane_id=pane.get("pane_id") if type(pane) is dict else None
+            if type(tab_id) is not str or not tab_id or type(pane_id) is not str or not pane_id:
+                rec=update_agent(name,rec,{"lifecycle":"UNKNOWN","start_error":"tab_create_identity_missing"})
+                finish_request(claim,"UNKNOWN",agent=name,stage="TAB_CREATED_IDENTITY_UNKNOWN")
+                return {**rec,"request_id":request_id,"status":"UNKNOWN"}
+            rec=update_agent(name,rec,{"tab_id":tab_id,"pane_id":pane_id})
+        except subprocess.TimeoutExpired as exc:
+            rec=update_agent(name,rec,{"lifecycle":"UNKNOWN","start_error":"tab_create_timeout"})
+            finish_request(claim,"UNKNOWN",agent=name,stage="TAB_CREATE",error_code="HERDR_TIMEOUT")
+            return {**rec,"request_id":request_id,"status":"UNKNOWN"}
+        except Exception as exc:
+            rec=update_agent(name,rec,{"lifecycle":"FAILED","start_error":str(exc)})
+            finish_request(claim,"FAILED",agent=name,stage="TAB_CREATE",error_code="HERDR_CREATE_FAILED")
+            raise
+        event("agent_creating",**rec)
+        try:
+            start_cmd=["agent","start",name,"--kind",kind,"--pane",pane_id,"--timeout","30000"]
+            if model is not None:
+                args=["--model",model]
+                if reasoning is not None:
+                    args += ["-c",f"model_reasoning_effort={reasoning}","--strict-config"]
+                start_cmd += ["--",*args]
+            started=herdr_json(start_cmd,timeout=40,session=session)
+            external_agent=extract_agent(started)
+            external_session=external_agent.get("agent_session") if isinstance(external_agent,dict) else None
+            external_session=(external_session.get("value") if isinstance(external_session,dict)
+                              else external_session)
+            if type(external_session) is str and external_session.strip():
+                rec=update_agent(name,rec,{"herdr_agent_session_value":external_session})
+        except subprocess.TimeoutExpired:
+            rec=update_agent(name,rec,{"lifecycle":"UNKNOWN","start_error":"agent_start_timeout"})
+            finish_request(claim,"UNKNOWN",agent=name,tab_id=tab_id,pane_id=pane_id,
+                           instance=agent_instance(rec),herdr_agent_session_value=rec.get("herdr_agent_session_value"),
+                           stage="AGENT_START",error_code="HERDR_TIMEOUT")
+            return {**rec,"request_id":request_id,"status":"UNKNOWN"}
+        except Exception as start_error:
+            if "agent_not_ready" in str(start_error):
+                rec=update_agent(name,rec,{"lifecycle":"BLOCKED","start_error":"agent_not_ready"})
+                event("agent_start_blocked",agent=name,tab_id=tab_id,pane_id=pane_id)
+                preserve_focus(previous_focus,tab_id,session)
+                finish_request(claim,"BLOCKED",agent=name,tab_id=tab_id,pane_id=pane_id,
+                               instance=agent_instance(rec),
+                               herdr_agent_session_value=rec.get("herdr_agent_session_value"))
+                return {**rec,"request_id":request_id}
+            rollback_error=None
+            try: herdr_json(["tab","close",tab_id],timeout=15,session=session)
+            except Exception as exc: rollback_error=str(exc)
+            changes={"lifecycle":"FAILED","failed_at":now(),"start_error":str(start_error)}
+            if rollback_error: changes["rollback_error"]=rollback_error
+            rec=update_agent(name,rec,changes)
+            event("agent_start_failed",agent=name,tab_id=tab_id,pane_id=pane_id,rollback_error=rollback_error)
+            preserve_focus(previous_focus,tab_id,session)
+            finish_request(claim,"FAILED",agent=name,tab_id=tab_id,pane_id=pane_id,
+                           stage="AGENT_START",error_code="HERDR_START_FAILED")
+            raise
+        rec=update_agent(name,rec,{"lifecycle":"IDLE","ready_at":now()})
+        event("agent_ready",agent=name,role=role,tab_id=tab_id,pane_id=pane_id,parent_task_id=parent_task_id)
+        preserve_focus(previous_focus,tab_id,session)
+        finish_request(claim,"CREATED",agent=name,tab_id=tab_id,pane_id=pane_id,
+                       instance=agent_instance(rec),
+                       herdr_agent_session_value=rec.get("herdr_agent_session_value"))
+        return {**rec,"request_id":request_id}
 
 def start_review_pair(cwd):
     """复用活跃固定代理；只创建缺失或已停止的代理，保留部分结果。"""
@@ -264,6 +458,7 @@ def release(name):
         rec=r["agents"].get(name)
         if not rec: raise SystemExit(f"unknown agent: {name}")
         if rec.get("lifecycle")=="CREATING": raise SystemExit(f"agent transition active: {name}")
+        session=agent_session(name,rec)
         if rec.get("operation_kind") in {"dispatch", "send"}:
             raise RuntimeError(f"代理正在发送或派发操作：{name}")
         task_id=rec.get("current_task_id")
@@ -277,7 +472,7 @@ def release(name):
     event("agent_stopping",agent=name,tab_id=tab_id)
     # 创建阶段失败且没有 tab 时没有外部资源可关闭，直接完成清理。
     if tab_id:
-        herdr_json(["tab","close",tab_id])
+        herdr_json(["tab","close",tab_id],session=session)
     with registry_transaction() as r:
         current=r["agents"].get(name)
         if current!=expected:
@@ -298,17 +493,24 @@ def release(name):
     event("agent_stopped",agent=name,tab_id=tab_id)
     return current
 
-def list_live_herdr():
+def list_live_herdr(session=None):
     try:
-        obj=herdr_json(["agent","list"],timeout=15)
+        obj=herdr_json(["agent","list"],timeout=15,session=session)
         xs=obj.get("result",{}).get("agents",obj.get("result",[]))
         return xs if isinstance(xs,list) else []
     except Exception as e:
         event("herdr_unavailable",error=str(e)); return []
 
-def agent_status_obj(name):
+def agent_status_obj(name,session=None):
     try:
-        return herdr_json(["agent","get",name],timeout=15)
+        record=registry()["agents"].get(name)
+        stored=record.get("herdr_session") if isinstance(record,dict) else None
+        if stored and session and stored!=session:
+            raise gates.GateError("HERDR_SESSION_MISMATCH","查询 session 与代理记录不一致")
+        target=stored or session or HERDR_SESSION
+        if type(target) is not str or not target.strip():
+            raise gates.GateError("HERDR_SESSION_REQUIRED","旧代理记录需要显式 Herdr session 才能查询")
+        return herdr_json(["agent","get",name],timeout=15,session=target)
     except Exception as e:
         # A transient CLI/startup failure is not proof that the agent was deleted.
         event("agent_get_error",agent=name,error=str(e)[:1200])
@@ -348,14 +550,25 @@ def live_agents(snapshot):
         else: names.add(name)
     return agents
 
-def same_agent_instance(rec,agent,name=None):
-    """只允许名称和已保存的 tab/pane 身份同时匹配。"""
+def observed_agent_session(agent):
+    value=agent.get("agent_session") if isinstance(agent,dict) else None
+    if isinstance(value,dict): value=value.get("value")
+    return value if type(value) is str and value.strip() else None
+
+def same_agent_instance(rec,agent,name=None,session=None):
+    """将本地实例绑定与 Herdr 可观测身份分开核对。"""
     expected_name=rec.get("name") or name
+    expected_session=rec.get("herdr_session")
     if not isinstance(agent,dict) or agent.get("name")!=expected_name: return False
+    if type(expected_session) is not str or not expected_session.strip(): return False
+    if session is not None and session!=expected_session: return False
     for key in ("tab_id","pane_id"):
-        expected=rec.get(key)
-        if expected is not None and (agent.get(key) is None or str(agent.get(key))!=str(expected)):
+        expected=rec.get(key); actual=agent.get(key)
+        if type(expected) is not str or not expected.strip() or type(actual) is not str or actual!=expected:
             return False
+    expected_external=rec.get("herdr_agent_session_value")
+    actual_external=observed_agent_session(agent)
+    if expected_external and actual_external and expected_external!=actual_external: return False
     return True
 
 def deterministic_semantic(runtime):
@@ -365,7 +578,7 @@ def deterministic_semantic(runtime):
     return None
 
 def api_key():
-    return os.getenv("TYPESAFE_API_KEY","").strip()
+    return _configured_value("TYPESAFE_API_KEY")
 
 JEV_REVIEW_QUESTIONS={
     "completion":"Does the evidence demonstrate that the requested task is completed?",
@@ -437,6 +650,8 @@ def sensor(name,force=False,observed=None):
     r=registry(); rec=r["agents"].get(name)
     if not rec: raise SystemExit(f"unknown agent: {name}")
     obj=extract_agent(agent_status_obj(name)) if observed is None else observed
+    if not same_agent_instance(rec,obj,name,rec.get("herdr_session")):
+        raise gates.GateError("AGENT_INSTANCE_UNKNOWN","无法确认代理的 Herdr session、tab 与 pane 身份")
     instance=[rec.get("created_at"),rec.get("pane_id"),rec.get("tab_id")]
     runtime=runtime_status(obj)
     sem=deterministic_semantic(runtime)
@@ -444,7 +659,7 @@ def sensor(name,force=False,observed=None):
     if sem is None:
         old=read_json(SEMANTIC/f"{name}.json",{})
         if not force and old.get("task_id")==rec.get("current_task_id") and old.get("instance")==instance and old.get("runtime_status")==runtime and now()-float(old.get("ts",0))<SENSOR_MIN_INTERVAL: return old
-        out=run(herdr_command("agent","read",name,"--source","recent-unwrapped","--lines","80"),timeout=15,check=False).stdout[-12000:]
+        out=run(herdr_command("agent","read",name,"--source","recent-unwrapped","--lines","80",session=agent_session(name,rec)),timeout=15,check=False).stdout[-12000:]
         source="jev"
         try:
             j=jev_call(
@@ -658,126 +873,195 @@ def begin_task(name,task_id,operation=None,operation_kind=None):
             if operation_kind: rec["operation_kind"]=operation_kind
     return rec
 
-def delegate(name,prompt,parent_task_id=None):
-    task_id=f"relay-{uuid.uuid4().hex[:10]}"
-    rec=begin_task(name,task_id)
-    identity=rec.get("tab_id")
-    lock=LOCKS/f"{name}.lock"
-    state={"task_id":task_id,"parent_task_id":parent_task_id or rec.get("parent_task_id"),"agent":name,"phase":"RUNNING",
-           "rework_count":0,"max_reworks":MAX_REWORKS,"requirement":prompt,"created_at":now()}
-    write_json(TASKS/f"{task_id}.json",state)
-    settled=False
-    try:
-        event("task_dispatch",task_id=task_id,agent=name)
-        current=prompt
-        while True:
-            marker=f"[RELAY TASK {task_id} ATTEMPT {state['rework_count']}]"
-            state["attempt_marker"]=marker
-            write_json(TASKS/f"{task_id}.json",state)
-            full=f"{marker}\n{current}\nWhen finished, summarize what you changed and the verification evidence."
-            settled=False
-            p=run(herdr_command("agent","prompt",name,full,"--wait","--timeout","300000"),timeout=310,check=False)
+def _task_prompt(task,marker,completion_marker):
+    return ("Relay schema_version=1 task package. Execute only this canonical JSON package.\n"
+            f"{marker}\n"
+            f"On completion, begin the final response with {completion_marker}, "
+            "then provide result and verification evidence.\n"+canonical_json(task))
+
+def _request_cached(claim):
+    record=claim["record"]
+    result=record.get("result")
+    if isinstance(result,dict): return {**result,"cached":True}
+    return {"agent":record.get("target"),"accepted":False,"status":record.get("status","UNKNOWN"),
+            "request_id":record.get("request_id"),"cached":True,
+            "error":{"code":record.get("error_code","REQUEST_NOT_REPLAYED"),"message":"该请求已有记录，未重放"}}
+
+def delegate(name,task,parent_task_id=None,request_id=None):
+    digest=_require_task_approval(task)
+    task=validate_task(task)
+    request_id=_request_id(request_id)
+    with request_claim(request_id,"DELEGATE",digest,name) as claim:
+        if not claim["claimed"]: return _request_cached(claim)
+        rec0=registry()["agents"].get(name)
+        session=agent_session(name,rec0)
+        require_agent_task_cwd(rec0,task)
+        task_id=f"relay-{uuid.uuid4().hex[:10]}"
+        rec=begin_task(name,task_id)
+        identity=agent_instance(rec); lock=LOCKS/f"{name}.lock"
+        marker=f"[RELAY TASK {task_id}]"
+        state={"task_id":task_id,"request_id":request_id,"task_sha256":digest,
+               "task_package":task,"parent_task_id":parent_task_id or rec.get("parent_task_id"),
+               "agent":name,"phase":"RUNNING","rework_count":0,"max_reworks":0,
+               "requirement":canonical_json(task),"created_at":now()}
+        write_json(TASKS/f"{task_id}.json",state)
+        finish_request(claim,"DISPATCHING",task_id=task_id,herdr_session=session)
+        settled=False
+        try:
+            event("task_dispatch",task_id=task_id,agent=name)
+            full=_task_prompt(task,marker,f"[RELAY FINISHED {task_id}]")
+            p=run(herdr_command("agent","prompt",name,full,"--wait","--timeout","300000",session=session),timeout=310,check=False)
             if p.returncode:
-                state["phase"]="HUMAN_REVIEW"; state["final_state"]="HUMAN_REVIEW"; state["error"]=p.stderr[-4000:]
-                write_json(TASKS/f"{task_id}.json",state); event("task_command_error",task_id=task_id,agent=name)
+                state.update(phase="HUMAN_REVIEW",final_state="HUMAN_REVIEW",error=p.stderr[-4000:])
+                write_json(TASKS/f"{task_id}.json",state)
+                finish_request(claim,"FAILED",result=state,error_code="HERDR_PROMPT_FAILED")
                 return state
-            obj=extract_agent(agent_status_obj(name))
-            runtime=runtime_status(obj)
+            runtime=runtime_status(extract_agent(agent_status_obj(name)))
             if runtime=="blocked":
-                state["phase"]="BLOCKED"; state["final_state"]="BLOCKED"; write_json(TASKS/f"{task_id}.json",state); return state
+                state.update(phase="BLOCKED",final_state="BLOCKED")
+                write_json(TASKS/f"{task_id}.json",state)
+                finish_request(claim,"BLOCKED",result=state)
+                return state
             if runtime not in {"idle","done"}:
-                raise RuntimeError(f"runtime_not_settled: {runtime}")
+                state.update(phase="UNKNOWN",final_state="UNKNOWN",error="runtime_not_settled")
+                write_json(TASKS/f"{task_id}.json",state)
+                finish_request(claim,"UNKNOWN",result=state,error_code="HERDR_RUNTIME_UNKNOWN")
+                return state
             settled=True
-            output=run(herdr_command("agent","read",name,"--source","recent-unwrapped","--lines","160"),timeout=20,check=False)
+            output=run(herdr_command("agent","read",name,"--source","recent-unwrapped","--lines","160",session=session),timeout=20,check=False)
             if output.returncode: raise RuntimeError(output.stderr or "output_read_failed")
             out=output.stdout
             if marker not in out:
-                state["phase"]="HUMAN_REVIEW"; state["final_state"]="HUMAN_REVIEW"; state["error"]="output_scope_error: task marker missing"
-                write_json(TASKS/f"{task_id}.json",state); event("output_scope_error",task_id=task_id,agent=name); return state
+                state.update(phase="HUMAN_REVIEW",final_state="HUMAN_REVIEW",error="output_scope_error: task marker missing")
+                write_json(TASKS/f"{task_id}.json",state)
+                finish_request(claim,"HUMAN_REVIEW",result=state,error_code="TASK_OUTPUT_SCOPE_INVALID")
+                return state
             scoped=out[out.find(marker):]
-            for boundary in re.finditer(r"\[RELAY TASK [^\]\n]+\]",scoped):
-                if boundary.group()!=marker:
-                    scoped=scoped[:boundary.start()]; break
-            try:
-                rv=review(task_id,name,prompt,scoped)
-            except Exception as e:
-                rv={"route":"DEEP_REVIEW","error":str(e)}
+            try: rv=review(task_id,name,canonical_json(task),scoped)
+            except Exception as exc: rv={"route":"DEEP_REVIEW","error":str(exc)}
             state["last_review"]=rv
             if rv.get("error"): state["error"]=rv["error"]
-            route=rv["route"]
-            if route=="PASS":
-                state["phase"]="DONE"; state["final_state"]="DONE"; break
-            if route=="BLOCKED":
-                state["phase"]="BLOCKED"; state["final_state"]="BLOCKED"; break
-            if route=="DEEP_REVIEW":
-                state["phase"]="DEEP_REVIEW"; state["final_state"]="DEEP_REVIEW"; break
-            if route=="REWORK":
-                if state["rework_count"]>=MAX_REWORKS:
-                    state["phase"]="DEEP_REVIEW"; state["final_state"]="DEEP_REVIEW"; state["reason"]="rework_limit_reached"; break
-                state["rework_count"]+=1; state["phase"]="REWORKING"
-                current=f"""Rework the SAME task. Jev found issues.
-rework_reason: {rv.get('rework_reason')}
-deep_reason: {rv.get('deep_reason')}
-scores: {json.dumps(rv.get('scores'),ensure_ascii=False)}
-Fix the identified issues and provide concrete verification evidence."""
-                write_json(TASKS/f"{task_id}.json",state); event("rework_dispatch",task_id=task_id,agent=name,rework_count=state["rework_count"])
-                continue
-        state["finished_at"]=now(); write_json(TASKS/f"{task_id}.json",state)
-        return state
-    except Exception as e:
-        state["phase"]="HUMAN_REVIEW"; state["final_state"]="HUMAN_REVIEW"; state["error"]=str(e)
-        write_json(TASKS/f"{task_id}.json",state)
-        return state
-    finally:
-        with registry_transaction() as r:
-            rec=r["agents"].get(name)
-            if settled and rec and rec.get("tab_id")==identity and rec.get("lifecycle")=="BUSY" and rec.get("current_task_id")==task_id:
-                rec.update(lifecycle="IDLE",last_task_id=task_id,current_task_id=None,last_seen=now())
-                _release_lock(lock,task_id)
+            route=rv.get("route")
+            final={"PASS":"DONE","BLOCKED":"BLOCKED","DEEP_REVIEW":"DEEP_REVIEW",
+                   "REWORK":"REWORK"}.get(route,"DEEP_REVIEW")
+            state.update(phase=final,final_state=final,finished_at=now())
+            if final=="REWORK": state["reason"]="manual_rework_required"
+            write_json(TASKS/f"{task_id}.json",state)
+            finish_request(claim,final,result=state)
+            return state
+        except subprocess.TimeoutExpired:
+            state.update(phase="UNKNOWN",final_state="UNKNOWN",error="Herdr 请求超时，状态未知；未重放")
+            write_json(TASKS/f"{task_id}.json",state)
+            finish_request(claim,"UNKNOWN",result=state,error_code="HERDR_TIMEOUT")
+            return state
+        except Exception as exc:
+            state.update(phase="HUMAN_REVIEW",final_state="HUMAN_REVIEW",error=str(exc))
+            write_json(TASKS/f"{task_id}.json",state)
+            finish_request(claim,"FAILED",result=state,error_code="DELEGATE_FAILED")
+            return state
+        finally:
+            if settled:
+                with registry_transaction() as r:
+                    current=r["agents"].get(name)
+                    if current and agent_instance(current)==identity and current.get("lifecycle")=="BUSY" and current.get("current_task_id")==task_id:
+                        current.update(lifecycle="IDLE",last_task_id=task_id,current_task_id=None,last_seen=now())
+                        _release_lock(lock,task_id)
 
-def dispatch_opaque(name,prompt,parent_task_id=None):
-    """确认原始消息发送成功，并保留活动任务锁。"""
-    task_id=f"relay-{uuid.uuid4().hex[:10]}"
-    token=uuid.uuid4().hex
-    rec=begin_task(name,task_id,operation=token,operation_kind="dispatch")
-    marker=f"[RELAY TASK {task_id}]"
-    completion_marker=f"[RELAY FINISHED {task_id}]"
-    protocol=("异步任务协议：请执行末尾的原始任务。完成后，最终回复的第一行必须输出 "
-              "`[RELAY FINISHED 任务编号]`，其中任务编号取本消息中的任务标记；"
-              "下一行起给出实际结果和验证证据。")
-    payload=f"{protocol}\n{marker}\n{prompt}"
-    state={"task_id":task_id,"parent_task_id":parent_task_id or rec.get("parent_task_id"),
-           "agent":name,"phase":"RUNNING","requirement":prompt,"created_at":now(),"dispatch_mode":"opaque_async",
-           "marker":marker,"completion_marker":completion_marker,"instance":agent_instance(rec)}
-    with registry_transaction() as r:
-        current=r["agents"].get(name,{})
-        if current.get("operation")!=token or current.get("lifecycle")!="BUSY":
-            raise RuntimeError("派发所有权已失效")
+def dispatch_opaque(name,task,parent_task_id=None,request_id=None):
+    """校验本地 Jev 批准后派发版本化任务包，并保留活动任务锁。"""
+    digest=_require_task_approval(task)
+    task=validate_task(task)
+    request_id=_request_id(request_id)
+    rec0=registry()["agents"].get(name)
+    session=agent_session(name,rec0)
+    require_agent_task_cwd(rec0,task)
+    with request_claim(request_id,"DISPATCH",digest,name) as claim:
+        if not claim["claimed"]: return _request_cached(claim)
+        task_id=f"relay-{uuid.uuid4().hex[:10]}"
+        token=uuid.uuid4().hex
+        rec=begin_task(name,task_id,operation=token,operation_kind="dispatch")
+        marker=f"[RELAY TASK {task_id}]"; completion_marker=f"[RELAY FINISHED {task_id}]"
+        state={"task_id":task_id,"request_id":request_id,"task_sha256":digest,
+               "task_package":task,"parent_task_id":parent_task_id or rec.get("parent_task_id"),
+               "agent":name,"phase":"RUNNING","requirement":canonical_json(task),
+               "created_at":now(),"dispatch_mode":"opaque_async","marker":marker,
+               "completion_marker":completion_marker,"instance":agent_instance(rec),
+               "herdr_session":session}
         write_json(TASKS/f"{task_id}.json",state)
-    error=None
-    try:
-        proc=run(herdr_command("agent","prompt",name,payload),timeout=20,check=False)
-        if proc.returncode: raise RuntimeError(proc.stderr or proc.stdout or f"prompt rc={proc.returncode}")
-    except Exception as exc:
-        error=str(exc)
-    with registry_transaction() as r:
-        current=r["agents"].get(name,{})
-        lock=LOCKS/f"{name}.lock"
-        if (current.get("operation")!=token or current.get("lifecycle")!="BUSY" or
-            current.get("current_task_id")!=task_id or agent_instance(current)!=state["instance"] or
-            not lock.exists() or lock.read_text()!=task_id):
-            return {"agent":name,"task_id":task_id,"accepted":False,"error":"派发所有权已失效"}
-        current.pop("operation",None)
-        current.pop("operation_kind",None)
-        if error: state.update(phase="HUMAN_REVIEW",error=error)
-        else: state["dispatch_confirmed"]=True
-        write_json(TASKS/f"{task_id}.json",state)
-    if error: return {"agent":name,"task_id":task_id,"accepted":False,"error":error}
-    event("opaque_dispatch",task_id=task_id,agent=name,parent_task_id=state["parent_task_id"])
-    return {"agent":name,"task_id":task_id,"accepted":True}
+        finish_request(claim,"DISPATCHING",task_id=task_id,herdr_session=session)
+        try:
+            proc=run(herdr_command("agent","prompt",name,_task_prompt(task,marker,completion_marker),session=session),timeout=20,check=False)
+            if proc.returncode:
+                state.update(phase="HUMAN_REVIEW",error=proc.stderr or proc.stdout or f"prompt rc={proc.returncode}")
+                finish_request(claim,"FAILED",error_code="HERDR_PROMPT_FAILED",task_id=task_id)
+                result={"agent":name,"task_id":task_id,"task_sha256":digest,"accepted":False,
+                        "status":"FAILED","request_id":request_id,"error":{"code":"HERDR_PROMPT_FAILED","message":state["error"]}}
+            else:
+                state["dispatch_confirmed"]=True
+                finish_request(claim,"DISPATCHED",task_id=task_id)
+                result={"agent":name,"task_id":task_id,"task_sha256":digest,"accepted":True,
+                        "status":"DISPATCHED","request_id":request_id}
+            write_json(TASKS/f"{task_id}.json",state)
+        except subprocess.TimeoutExpired:
+            state.update(phase="UNKNOWN",error="Herdr 请求超时，状态未知；未重放")
+            write_json(TASKS/f"{task_id}.json",state)
+            finish_request(claim,"UNKNOWN",task_id=task_id,error_code="HERDR_TIMEOUT")
+            result={"agent":name,"task_id":task_id,"task_sha256":digest,"accepted":False,
+                    "status":"UNKNOWN","request_id":request_id,
+                    "error":{"code":"HERDR_TIMEOUT","message":"Herdr 请求超时，状态未知；未重放"}}
+        except Exception as exc:
+            state.update(phase="HUMAN_REVIEW",error=str(exc))
+            write_json(TASKS/f"{task_id}.json",state)
+            finish_request(claim,"FAILED",task_id=task_id,error_code="HERDR_PROMPT_FAILED")
+            result={"agent":name,"task_id":task_id,"task_sha256":digest,"accepted":False,
+                    "status":"FAILED","request_id":request_id,
+                    "error":{"code":"HERDR_PROMPT_FAILED","message":str(exc)}}
+        with registry_transaction() as r:
+            current=r["agents"].get(name,{})
+            if current.get("operation")==token and agent_instance(current)==state["instance"]:
+                current.pop("operation",None); current.pop("operation_kind",None)
+        record=read_json(claim["path"],{})
+        record["result"]=result; write_json(claim["path"],record)
+        return result
+
+def dispatch_task(task,role,name=None,kind="codex",model=None,reasoning=None,
+                  session=None,parent_task_id=None,request_id=None):
+    digest=_require_task_approval(task)
+    task=validate_task(task)
+    if role not in ALLOWED_ROLES: raise gates.GateError("ROLE_INVALID","代理角色无效")
+    session=HERDR_SESSION if session is None else session
+    if type(session) is not str or not session.strip():
+        raise gates.GateError("HERDR_SESSION_REQUIRED","必须显式配置 Herdr session")
+    request_id=_request_id(request_id)
+    if len(request_id)>80: raise gates.GateError("REQUEST_ID_INVALID","组合请求 ID 过长")
+    name=name or unique_name(role)
+    with request_claim(request_id,"CREATE_AND_DISPATCH",digest,name) as claim:
+        if not claim["claimed"]: return _request_cached(claim)
+        finish_request(claim,"CREATING",herdr_session=session)
+        try:
+            created=spawn(role,task["working_directory"],name=name,parent_task_id=parent_task_id,
+                          kind=kind,model=model,reasoning=reasoning,session=session,
+                          request_id=request_id+"-create")
+            if created.get("lifecycle")!="IDLE":
+                status=created.get("status",created.get("lifecycle","UNKNOWN"))
+                result={"agent":name,"accepted":False,"status":status,"request_id":request_id,
+                        "creation":{"tab_id":created.get("tab_id"),"pane_id":created.get("pane_id")}}
+                finish_request(claim,status,result=result,error_code=created.get("start_error","CREATE_NOT_READY"))
+                return result
+            result=dispatch_opaque(name,task,parent_task_id,request_id+"-dispatch")
+            result.update(creation={"tab_id":created.get("tab_id"),"pane_id":created.get("pane_id")})
+            record_status=result.get("status","UNKNOWN")
+            finish_request(claim,record_status,result=result,
+                           error_code=result.get("error",{}).get("code"))
+            return result
+        except Exception as exc:
+            result=_structured_error(exc)
+            result.update(agent=name,request_id=request_id)
+            finish_request(claim,"FAILED",result=result,error_code=getattr(exc,"code","DISPATCH_TASK_FAILED"))
+            return result
 
 def agent_instance(rec):
-    return {key:rec.get(key) for key in ("tab_id","pane_id","created_at")}
+    return {key:rec.get(key) for key in ("herdr_session","tab_id","pane_id","created_at")}
 
 def task_result_evidence(evidence,marker,completion_marker):
     """只提取当前任务完成标记起的回复，拒绝回显或无结果标记。"""
@@ -794,28 +1078,21 @@ def task_result_evidence(evidence,marker,completion_marker):
 def has_task_result(evidence,marker,completion_marker):
     return task_result_evidence(evidence,marker,completion_marker) is not None
 
-def send_opaque(name,message):
-    """发送期间占用操作令牌，避免与冻结审查证据交错。"""
-    token=uuid.uuid4().hex
-    with registry_transaction() as r:
-        rec=r["agents"].get(name)
-        if not rec: raise SystemExit(f"unknown agent: {name}")
-        if rec.get("operation") or rec.get("lifecycle") not in {"IDLE","READY","BUSY"}:
-            raise RuntimeError("代理正在执行互斥操作")
-        rec["operation"]=token
-        rec["operation_kind"]="send"
-        expected=agent_instance(rec)
-    try:
-        p=run(herdr_command("agent","prompt",name,message),timeout=20,check=False)
-        if p.returncode: raise RuntimeError(p.stderr.strip() or p.stdout.strip() or f"herdr prompt rc={p.returncode}")
-        event("opaque_message",agent=name,task_id=rec.get("current_task_id"))
-        return {"agent":name,"accepted":True}
-    finally:
-        with registry_transaction() as r:
-            current=r["agents"].get(name,{})
-            if current.get("operation")==token and agent_instance(current)==expected:
-                current.pop("operation",None)
-                current.pop("operation_kind",None)
+def send_opaque(name,message,request_id=None):
+    """只接受版本化任务包或明示的状态、停止控制对象。"""
+    try: value=json.loads(message) if type(message) is str else message
+    except (TypeError,ValueError) as exc:
+        raise gates.GateError("TASK_PACKAGE_REQUIRED","消息必须是任务包 JSON 或显式控制对象") from exc
+    if type(value) is dict and set(value)=={"control"} and value["control"]=="status":
+        record=registry()["agents"].get(name)
+        if not record: raise gates.GateError("AGENT_NOT_FOUND","Relay 中没有此代理")
+        return {"agent":name,"status":record.get("lifecycle"),"current_task_id":record.get("current_task_id"),
+                "tab_id":record.get("tab_id"),"pane_id":record.get("pane_id"),"control":"status"}
+    if type(value) is dict and set(value)=={"control"} and value["control"]=="stop":
+        return {"agent":name,"control":"stop","result":release(name)}
+    if type(value) is dict:
+        return dispatch_opaque(name,value,request_id=request_id)
+    raise gates.GateError("TASK_PACKAGE_REQUIRED","自由文本派发已关闭；需要 schema_version=1 任务包")
 
 def finalize(task_id):
     """显式结算异步任务；审查结果交回 Astra，不自动派发返工。"""
@@ -853,14 +1130,12 @@ def finalize(task_id):
 
     def sample():
         obj=extract_agent(agent_status_obj(name))
-        if any(obj.get(key) is None for key in ("tab_id", "pane_id")):
+        if not same_agent_instance(rec,obj,name,rec.get("herdr_session")):
             raise RuntimeError("无法确认 Herdr 实例身份")
-        for key in ("tab_id","pane_id"):
-            if obj[key]!=identity[key]: raise RuntimeError("Herdr 实例已变更")
         runtime=runtime_status(obj)
         if runtime not in {"idle","done","blocked"}: return runtime,None
         if runtime=="blocked": return runtime,None
-        proc=run(herdr_command("agent","read",name,"--source","recent-unwrapped","--lines","400"),timeout=15,check=False)
+        proc=run(herdr_command("agent","read",name,"--source","recent-unwrapped","--lines","400",session=agent_session(name,rec)),timeout=15,check=False)
         if proc.returncode: raise RuntimeError("无法读取审查证据")
         return runtime,proc.stdout
 
@@ -947,33 +1222,51 @@ def finalize(task_id):
         write_json(path,state)
         return state if result["final_state"]!="RUNNING" else dict(state,**result)
 
-def sync(settle=True,snapshot=None,confirm_absence=True):
+def sync(settle=True,snapshot=None,confirm_absence=True,session=None):
     r=registry()
     changed=[]
-    # Reconciliation requires a successful authoritative snapshot. If Herdr is
-    # unavailable, preserve state rather than manufacturing REMOVED agents.
+    sessions=([session] if session else sorted({rec.get("herdr_session") for rec in r["agents"].values()
+                                               if type(rec.get("herdr_session")) is str and rec.get("herdr_session")}))
+    if not session and HERDR_SESSION and HERDR_SESSION not in sessions: sessions.append(HERDR_SESSION)
+    if not sessions:
+        event("herdr_sync_unknown",reason="no_explicit_session")
+        return {"changed":changed,"agents":r["agents"],"status":"UNKNOWN"}
+    snapshots={}; live_by_session={}
     try:
-        snap=herdr_json(["agent","list"],timeout=15) if snapshot is None else snapshot
-        live=live_agents(snap)
-        if not isinstance(live,list):
-            raise RuntimeError(f"unexpected Herdr agent-list shape: {snap}")
+        for current_session in sessions:
+            if snapshot is not None:
+                if session is None and len(sessions)!=1:
+                    raise RuntimeError("提供单一快照时必须指定其 Herdr session")
+                snap=snapshot
+            else:
+                snap=herdr_json(["agent","list"],timeout=15,session=current_session)
+            live=live_agents(snap)
+            if not isinstance(live,list): raise RuntimeError(f"unexpected Herdr agent-list shape: {snap}")
+            snapshots[current_session]=snap
+            live_by_session[current_session]=live
     except Exception as e:
         event("herdr_sync_error",error=str(e)[:1200])
-        return {"changed":changed,"agents":r["agents"]}
-    live_names={str(x.get("name")) for x in live if isinstance(x,dict) and x.get("name")}
-    live_panes={str(x.get("pane_id")) for x in live if isinstance(x,dict) and x.get("pane_id")}
-    snapshot=r
+        return {"changed":changed,"agents":r["agents"],"status":"UNKNOWN"}
+    snapshot_registry=r
     absent={}
-    for name,rec in snapshot["agents"].items():
+    for name,rec in snapshot_registry["agents"].items():
+        current_session=rec.get("herdr_session") or session or HERDR_SESSION
+        if current_session not in snapshots: continue
+        live=live_by_session[current_session]
+        live_names={str(x.get("name")) for x in live if isinstance(x,dict) and x.get("name")}
+        live_panes={str(x.get("pane_id")) for x in live if isinstance(x,dict) and x.get("pane_id")}
         lifecycle=rec.get("lifecycle")
         removed_task=(lifecycle=="REMOVED" and isinstance(rec.get("current_task_id"),str))
         if ((lifecycle not in {"CREATING","STOPPING","STOPPED","FAILED","REMOVED"} or removed_task)
                 and name not in live_names and str(rec.get("pane_id")) not in live_panes):
-            absent[name]=agent_status_obj(name) if confirm_absence else None
+            absent[name]=agent_status_obj(name,session=current_session) if confirm_absence else None
     with registry_transaction() as r:
-        for name,expected in snapshot["agents"].items():
+        for name,expected in snapshot_registry["agents"].items():
             rec=r["agents"].get(name)
             if rec!=expected: continue
+            current_session=rec.get("herdr_session") or session or HERDR_SESSION
+            if current_session not in snapshots: continue
+            live=live_by_session[current_session]
             lifecycle=rec.get("lifecycle")
             if lifecycle=="REMOVED":
                 task_id=rec.get("current_task_id")
@@ -1007,8 +1300,11 @@ def sync(settle=True,snapshot=None,confirm_absence=True):
                 continue
             if lifecycle in {"STOPPED","FAILED","CREATING","STOPPING"}:
                 continue
-            observed=next((x for x in live if same_agent_instance(rec,x,name)),None)
+            observed=next((x for x in live if same_agent_instance(rec,x,name,current_session)),None)
             if observed is not None:
+                external_session=observed_agent_session(observed)
+                if external_session and not rec.get("herdr_agent_session_value"):
+                    rec["herdr_agent_session_value"]=external_session
                 if rec.get("operation"): continue
                 rec["last_seen"]=now()
                 if lifecycle=="BLOCKED" and runtime_status(observed) in {"idle","done"}:
@@ -1063,69 +1359,103 @@ def daemon():
     event("daemon_start",version=VERSION)
     while True:
         try:
-            snapshot=herdr_json(["agent","list"],timeout=15)
-            sync(settle=False,snapshot=snapshot,confirm_absence=False)
-            live=live_agents(snapshot)
-            r=registry()
-            for name,rec in r["agents"].items():
-                if rec.get("lifecycle")=="BUSY":
-                    observed=next((x for x in live if same_agent_instance(rec,x,name)),None)
-                    if observed is None:
-                        continue
-                    try: sensor(name,observed=observed)
-                    except Exception as e: event("daemon_agent_error",agent=name,error=str(e))
+            current=registry()
+            sessions={rec.get("herdr_session") for rec in current["agents"].values()
+                      if type(rec.get("herdr_session")) is str and rec.get("herdr_session")}
+            if HERDR_SESSION: sessions.add(HERDR_SESSION)
+            for current_session in sorted(sessions):
+                try:
+                    snapshot=herdr_json(["agent","list"],timeout=15,session=current_session)
+                    sync(settle=False,snapshot=snapshot,confirm_absence=False,session=current_session)
+                    live=live_agents(snapshot)
+                    current=registry()
+                    for name,rec in current["agents"].items():
+                        record_session=rec.get("herdr_session") or HERDR_SESSION
+                        if rec.get("lifecycle")!="BUSY" or record_session!=current_session:
+                            continue
+                        observed=next((item for item in live if same_agent_instance(
+                            rec,item,name,current_session)),None)
+                        if observed is None: continue
+                        try: sensor(name,observed=observed)
+                        except Exception as e: event("daemon_agent_error",agent=name,error=str(e))
+                except Exception as e:
+                    event("daemon_session_error",herdr_session=current_session,error=str(e))
         except Exception as e: event("daemon_error",error=str(e))
         time.sleep(poll)
 
-def main():
-    ensure()
+def main(argv=None):
     ap=argparse.ArgumentParser(prog="astra-relay")
     ap.add_argument("--version",action="store_true")
     sp=ap.add_subparsers(dest="cmd")
-    p=sp.add_parser("spawn"); p.add_argument("--role",required=True); p.add_argument("--cwd",default="."); p.add_argument("--name"); p.add_argument("--parent-task-id"); p.add_argument("--kind",default="codex"); p.add_argument("--model")
+    p=sp.add_parser("validate-task"); p.add_argument("--task-file",required=True); p.add_argument("--require-approved",action="store_true")
+    p=sp.add_parser("evaluate-task"); p.add_argument("--task-file",required=True)
+    p=sp.add_parser("dispatch-task"); p.add_argument("--task-file",required=True); p.add_argument("--role",required=True); p.add_argument("--name"); p.add_argument("--kind",default="codex"); p.add_argument("--model"); p.add_argument("--reasoning"); p.add_argument("--session"); p.add_argument("--parent-task-id"); p.add_argument("--request-id",required=True)
+    p=sp.add_parser("spawn"); p.add_argument("--role",required=True); p.add_argument("--cwd",default="."); p.add_argument("--name"); p.add_argument("--parent-task-id"); p.add_argument("--kind",default="codex"); p.add_argument("--model"); p.add_argument("--reasoning"); p.add_argument("--session"); p.add_argument("--request-id")
     p=sp.add_parser("start-review-pair"); p.add_argument("--cwd",default=".")
     p=sp.add_parser("release"); p.add_argument("name")
     p=sp.add_parser("finalize"); p.add_argument("task_id")
     p=sp.add_parser("record-final-evidence"); p.add_argument("task_id"); p.add_argument("--json-file",required=True)
-    p=sp.add_parser("delegate"); p.add_argument("name"); p.add_argument("prompt"); p.add_argument("--parent-task-id")
-    p=sp.add_parser("dispatch-opaque"); p.add_argument("name"); p.add_argument("--prompt-file",required=True); p.add_argument("--parent-task-id")
-    p=sp.add_parser("send-opaque"); p.add_argument("name"); p.add_argument("--message-file",required=True)
+    p=sp.add_parser("delegate"); p.add_argument("name"); p.add_argument("prompt",nargs="?"); p.add_argument("--task-file"); p.add_argument("--parent-task-id"); p.add_argument("--request-id")
+    p=sp.add_parser("dispatch-opaque"); p.add_argument("name"); p.add_argument("--task-file"); p.add_argument("--prompt-file"); p.add_argument("--parent-task-id"); p.add_argument("--request-id")
+    p=sp.add_parser("send-opaque"); p.add_argument("name"); p.add_argument("--message-file",required=True); p.add_argument("--request-id")
     p=sp.add_parser("status"); p.add_argument("name",nargs="?")
     p=sp.add_parser("semantic-status"); p.add_argument("name")
     sp.add_parser("list"); sp.add_parser("sync"); sp.add_parser("daemon")
-    a=ap.parse_args()
-    if a.version: print(VERSION); return
-    if a.cmd=="spawn": print(json.dumps(spawn(a.role,a.cwd,a.name,a.parent_task_id,a.kind,a.model),ensure_ascii=False,indent=2))
-    elif a.cmd=="start-review-pair":
-        result=start_review_pair(a.cwd)
-        print(json.dumps(result,ensure_ascii=False,indent=2))
-        if not result["complete"]: raise SystemExit(1)
-    elif a.cmd=="release": print(json.dumps(release(a.name),ensure_ascii=False,indent=2))
-    elif a.cmd=="finalize":
-        result=finalize(a.task_id)
-        print(json.dumps(result,ensure_ascii=False,indent=2))
-        if result.get("final_state")!="DONE": raise SystemExit(1)
-    elif a.cmd=="record-final-evidence":
-        print(json.dumps(record_final_evidence(a.task_id,json.loads(Path(a.json_file).read_text(encoding="utf-8"))),ensure_ascii=False,indent=2))
-    elif a.cmd=="delegate":
-        result=delegate(a.name,a.prompt,a.parent_task_id)
-        print(json.dumps(result,ensure_ascii=False,indent=2))
-        if result.get("final_state")!="DONE": raise SystemExit(1)
-    elif a.cmd=="dispatch-opaque":
-        prompt=Path(a.prompt_file).read_text(encoding="utf-8")
-        result=dispatch_opaque(a.name,prompt,a.parent_task_id)
-        print(json.dumps(result,ensure_ascii=False,indent=2))
-        if result.get("accepted") is not True: raise SystemExit(1)
-    elif a.cmd=="send-opaque":
-        message=Path(a.message_file).read_text(encoding="utf-8")
-        print(json.dumps(send_opaque(a.name,message),ensure_ascii=False,indent=2))
-    elif a.cmd=="status":
-        r=registry()
-        print(json.dumps(r["agents"].get(a.name) if a.name else r,ensure_ascii=False,indent=2))
-    elif a.cmd=="semantic-status":
-        print(json.dumps(read_json(SEMANTIC/f"{a.name}.json",{"error":"no semantic state"}),ensure_ascii=False,indent=2))
-    elif a.cmd=="list": print(json.dumps(registry(),ensure_ascii=False,indent=2))
-    elif a.cmd=="sync": print(json.dumps(sync(),ensure_ascii=False,indent=2))
-    elif a.cmd=="daemon": daemon()
-    else: ap.print_help()
-if __name__=="__main__": main()
+    a=ap.parse_args(argv)
+    if a.version: print(VERSION); return 0
+    try:
+        if a.cmd=="validate-task":
+            task=_load_task_file(a.task_file); digest=canonical_digest(task)
+            if a.require_approved: gates.require_approval(task,TYPESAFE_MODEL,STATE)
+            result={"ok":True,"task_sha256":digest,"rules_version":gates.RULES_VERSION,
+                    "task_id":task["task_id"],"revision":task["revision"],
+                    "approved":gates.approval_matches(task,TYPESAFE_MODEL,STATE)}
+        elif a.cmd=="evaluate-task":
+            task=_load_task_file(a.task_file)
+            result=gates.evaluate_once(task,TYPESAFE_MODEL,api_key(),STATE,
+                                       timeout=TYPESAFE_TIMEOUT,url=TYPESAFE_URL)
+            result={"ok":result.get("status")=="APPROVED","evaluation":result}
+        elif a.cmd=="dispatch-task":
+            task=_load_task_file(a.task_file)
+            result=dispatch_task(task,a.role,a.name,a.kind,a.model,a.reasoning,a.session,
+                                 a.parent_task_id,a.request_id)
+        elif a.cmd=="spawn":
+            result=spawn(a.role,a.cwd,a.name,a.parent_task_id,a.kind,a.model,a.reasoning,a.session,a.request_id)
+        elif a.cmd=="start-review-pair": result=start_review_pair(a.cwd)
+        elif a.cmd=="release": result=release(a.name)
+        elif a.cmd=="finalize": result=finalize(a.task_id)
+        elif a.cmd=="record-final-evidence":
+            result=record_final_evidence(a.task_id,json.loads(Path(a.json_file).read_text(encoding="utf-8")))
+        elif a.cmd in {"delegate","dispatch-opaque"}:
+            task_file=a.task_file if a.cmd=="delegate" else a.task_file
+            legacy_file=a.prompt_file if a.cmd=="dispatch-opaque" else None
+            if not task_file and legacy_file:
+                try: parsed=json.loads(Path(legacy_file).read_text(encoding="utf-8"))
+                except Exception: parsed=None
+                if type(parsed) is dict and "schema_version" in parsed: task=parsed
+                else: raise gates.GateError("TASK_PACKAGE_REQUIRED","自由文本旧入口已关闭；需要 schema_version=1 任务包")
+            elif task_file: task=_load_task_file(task_file)
+            else: raise gates.GateError("TASK_PACKAGE_REQUIRED","此入口必须提供 --task-file 版本化任务包")
+            request_id=a.request_id
+            result=(delegate(a.name,task,a.parent_task_id,request_id) if a.cmd=="delegate" else
+                    dispatch_opaque(a.name,task,a.parent_task_id,request_id))
+        elif a.cmd=="send-opaque":
+            result=send_opaque(a.name,Path(a.message_file).read_text(encoding="utf-8"),a.request_id)
+        elif a.cmd=="status":
+            r=registry(); result=r["agents"].get(a.name) if a.name else r
+        elif a.cmd=="semantic-status": result=read_json(SEMANTIC/f"{a.name}.json",{"error":"no semantic state"})
+        elif a.cmd=="list": result=registry()
+        elif a.cmd=="sync": result=sync()
+        elif a.cmd=="daemon": daemon(); return 0
+        else: ap.print_help(); return 0
+        print(json.dumps(result,ensure_ascii=False,indent=2,allow_nan=False))
+        if isinstance(result,dict) and (result.get("ok") is False or result.get("accepted") is False or
+              result.get("status") in {"UNKNOWN","FAILED","STALE"} or
+              (a.cmd=="delegate" and result.get("final_state")!="DONE") or
+              (a.cmd=="finalize" and result.get("final_state")!="DONE") or
+              (a.cmd=="start-review-pair" and not result.get("complete"))): return 1
+        return 0
+    except Exception as exc:
+        print(json.dumps(_structured_error(exc),ensure_ascii=False,indent=2))
+        return 1
+if __name__=="__main__": raise SystemExit(main())

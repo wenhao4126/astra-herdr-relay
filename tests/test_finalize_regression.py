@@ -4,21 +4,19 @@ import unittest
 from unittest.mock import patch
 
 import test_event_regression
-from test_relay import m
+from test_relay import approved_test_task, m, seed_agent
 
 
 class FinalizeRegressionTests(unittest.TestCase):
     setUp = test_event_regression.EventRegressionTests.setUp
 
     def prepare(self):
-        m.save_registry({'agents': {'worker': {
-            'lifecycle': 'IDLE', 'tab_id': 'tab', 'pane_id': 'pane', 'created_at': 123,
-        }}})
+        seed_agent(tab_id='tab',pane_id='pane',created_at=123)
         self.output = ''
         self.runtime = 'done'
         def external(cmd, **kwargs):
-            if cmd[2] == 'prompt':
-                lines = cmd[4].splitlines()
+            if 'prompt' in cmd:
+                lines = cmd[cmd.index('prompt') + 2].splitlines()
                 marker = next(line for line in lines if line.startswith('[RELAY TASK '))
                 task_id = marker[len('[RELAY TASK '):-1]
                 self.output = ('前一个任务的秘密\n' + marker + '\n' +
@@ -26,10 +24,10 @@ class FinalizeRegressionTests(unittest.TestCase):
                 return subprocess.CompletedProcess(cmd, 0, '', '')
             return subprocess.CompletedProcess(cmd, 0, self.output, '')
         self.enterContext(patch.object(m, 'run', side_effect=external))
-        self.enterContext(patch.object(m, 'agent_status_obj', side_effect=lambda name: {
+        self.enterContext(patch.object(m, 'agent_status_obj', side_effect=lambda name, **kwargs: {
             'result': {'agent': {'name': name, 'tab_id': 'tab', 'pane_id': 'pane', 'status': self.runtime}}
         }))
-        self.task_id = m.dispatch_opaque('worker', '任务')['task_id']
+        self.task_id = m.dispatch_opaque('worker', approved_test_task(m.STATE))['task_id']
         self.path = m.TASKS / (self.task_id + '.json')
 
     def require_finalize(self):
@@ -40,7 +38,8 @@ class FinalizeRegressionTests(unittest.TestCase):
         state = m.read_json(self.path, {})
         self.assertEqual(state.get('marker'), '[RELAY TASK ' + self.task_id + ']')
         self.assertEqual(state.get('completion_marker'), '[RELAY FINISHED ' + self.task_id + ']')
-        self.assertEqual(state.get('instance'), {'tab_id': 'tab', 'pane_id': 'pane', 'created_at': 123})
+        self.assertEqual(state.get('instance'), {'herdr_session': 'relay-test-session',
+                                                 'tab_id': 'tab', 'pane_id': 'pane', 'created_at': 123})
 
     def test_short_task_routes_are_persisted_once_without_rework(self):
         self.require_finalize()
@@ -202,9 +201,9 @@ class FinalizeRegressionTests(unittest.TestCase):
         self.prepare()
         def review(*args):
             for action in (lambda: m.finalize(self.task_id),
-                           lambda: m.dispatch_opaque('worker', '新任务'),
+                           lambda: m.dispatch_opaque('worker', approved_test_task(m.STATE,task_id='new-task')),
                            lambda: m.send_opaque('worker', '干扰消息')):
-                with self.assertRaises((SystemExit, RuntimeError)):
+                with self.assertRaises((SystemExit, RuntimeError, ValueError)):
                     action()
             return {'route': 'PASS'}
         with patch.object(m, 'review', side_effect=review):

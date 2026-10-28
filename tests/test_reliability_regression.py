@@ -9,9 +9,12 @@ from test_relay import m
 class ReliabilityRegressionTests(unittest.TestCase):
     setUp = test_event_regression.EventRegressionTests.setUp
 
-    def seed(self):
-        m.save_registry({'agents': {'worker': {'lifecycle': 'BUSY', 'created_at': 1,
-                                              'pane_id': 'p', 'current_task_id': 'new'}}})
+    def seed(self, legacy=False):
+        record={'name':'worker','role':'worker','kind':'codex','lifecycle':'BUSY','created_at':1,
+                'tab_id':'tab-worker','pane_id':'p','current_task_id':'new'}
+        if not legacy:
+            record['herdr_session']='relay-test-session'
+        m.save_registry({'agents': {'worker': record}})
 
     def seed_removed_orphan(self, task_id='relay-f134263f88', lock_task_id=None):
         m.save_registry({'agents': {'reviewer-relay-last-pass-0927': {
@@ -39,7 +42,28 @@ class ReliabilityRegressionTests(unittest.TestCase):
         self.assertEqual(task['phase'],'HUMAN_REVIEW')
         self.assertEqual(task['evidence'],'保留的审查证据')
         self.assertFalse((m.LOCKS/'reviewer-relay-last-pass-0927.lock').exists())
-        get_status.assert_called_once_with('reviewer-relay-last-pass-0927')
+        get_status.assert_called_once_with('reviewer-relay-last-pass-0927',session='relay-test-session')
+
+    def test_legacy_registry_without_session_stays_unknown_without_trusted_context(self):
+        self.seed_removed_orphan()
+        with patch.object(m,'HERDR_SESSION',''), patch.object(m,'herdr_json') as list_agents, \
+             patch.object(m,'agent_status_obj') as get_status:
+            result=m.sync()
+        self.assertEqual(result['status'],'UNKNOWN')
+        self.assertNotIn('herdr_session',m.registry()['agents']['reviewer-relay-last-pass-0927'])
+        list_agents.assert_not_called()
+        get_status.assert_not_called()
+
+    def test_legacy_registry_uses_only_explicit_session_for_absence_lookup(self):
+        self.seed_removed_orphan()
+        with patch.object(m,'HERDR_SESSION',''), \
+             patch.object(m,'herdr_json',return_value={'result':{'agents':[]}}), \
+             patch.object(m,'agent_status_obj',return_value=None) as get_status:
+            result=m.sync(session='trusted-session')
+        self.assertEqual(result['agents']['reviewer-relay-last-pass-0927']['current_task_id'],
+                         'relay-f134263f88')
+        self.assertNotIn('herdr_session',m.registry()['agents']['reviewer-relay-last-pass-0927'])
+        get_status.assert_called_once_with('reviewer-relay-last-pass-0927',session='trusted-session')
 
     def test_removed_legacy_orphan_cleans_owned_lock_without_rewriting_final_task(self):
         task_id='relay-f134263f88'
@@ -183,7 +207,7 @@ class ReliabilityRegressionTests(unittest.TestCase):
                     get_status.assert_not_called()
 
     def test_confirmed_absence_and_startup_grace(self):
-        self.seed()
+        self.seed(legacy=True)
         missing = {'error': {'code': 'agent_not_found'}, 'id': 'cli:agent:get'}
         def external(cmd, **kwargs):
             return subprocess.CompletedProcess(cmd, 0 if cmd[-1] == 'list' else 1,
@@ -195,7 +219,7 @@ class ReliabilityRegressionTests(unittest.TestCase):
             self.assertEqual(m.sync()['agents']['worker']['lifecycle'], 'REMOVED')
 
     def test_confirmed_orphan_moves_unsettled_task_to_human_review_and_releases_owned_lock(self):
-        self.seed()
+        self.seed(legacy=True)
         task_id='relay-orphan'
         with m.registry_transaction() as r:
             r['agents']['worker'].update(current_task_id=task_id,operation='stale-token',operation_kind='dispatch')
@@ -219,7 +243,7 @@ class ReliabilityRegressionTests(unittest.TestCase):
         self.assertFalse((m.LOCKS/'worker.lock').exists())
 
     def test_confirmed_orphan_does_not_touch_mismatched_task_or_lock(self):
-        self.seed()
+        self.seed(legacy=True)
         task_id='relay-orphan'
         with m.registry_transaction() as r:
             r['agents']['worker'].update(current_task_id=task_id)
@@ -234,7 +258,7 @@ class ReliabilityRegressionTests(unittest.TestCase):
         self.assertEqual(m.read_json(m.TASKS/f'{task_id}.json',{})['phase'],'RUNNING')
 
     def test_confirmed_orphan_keeps_unowned_lock_even_when_task_matches(self):
-        self.seed()
+        self.seed(legacy=True)
         task_id='relay-orphan'
         with m.registry_transaction() as r:
             r['agents']['worker'].update(current_task_id=task_id)
@@ -254,24 +278,32 @@ class ReliabilityRegressionTests(unittest.TestCase):
 
     def test_cache_is_bound_to_task_instance_and_runtime(self):
         self.seed()
-        with patch.object(m, 'agent_status_obj', return_value={'result': {'agent_status': 'done'}}):
+        with patch.object(m, 'agent_status_obj', return_value={'result': {'agent': {
+                'name':'worker','tab_id':'tab-worker','pane_id':'p','agent_status': 'done'}}}):
             m.sensor('worker')
         for changes in ({'current_task_id': 'next'}, {'pane_id': 'replacement'}, {}):
             with m.registry_transaction() as r: r['agents']['worker'].update(changes)
-            with patch.object(m, 'agent_status_obj', return_value={'result': {'agent_status': 'working'}}), patch.object(m, 'run', return_value=subprocess.CompletedProcess([], 0, '', '')), patch.object(m, 'jev_call', return_value={'semantic_status': 'PROGRESSING'}):
+            current=m.registry()['agents']['worker']
+            with patch.object(m, 'agent_status_obj', return_value={'result': {'agent': {
+                    'name':'worker','tab_id':current['tab_id'],'pane_id':current['pane_id'],
+                    'agent_status': 'working'}}}), patch.object(m, 'run', return_value=subprocess.CompletedProcess([], 0, '', '')), patch.object(m, 'jev_call', return_value={'semantic_status': 'PROGRESSING'}):
                 self.assertEqual(m.sensor('worker')['semantic_status'], 'PROGRESSING')
 
     def test_daemon_reuses_snapshot_and_continues_after_one_failure(self):
         self.seed()
         with m.registry_transaction() as r:
-            r['agents']['other'] = {'lifecycle': 'BUSY'}
-        snapshot = {'result': {'agents': [{'name': 'worker', 'pane_id': 'p', 'agent_status': 'working'}, {'name': 'other', 'agent_status': 'done'}]}}
+            r['agents']['other'] = {'name':'other','role':'worker','kind':'codex','lifecycle': 'BUSY',
+                                    'herdr_session':'relay-test-session','tab_id':'tab-other',
+                                    'pane_id':'pane-other'}
+        snapshot = {'result': {'agents': [{'name': 'worker','tab_id':'tab-worker','pane_id': 'p', 'agent_status': 'working'},
+                                          {'name': 'other','tab_id':'tab-other','pane_id':'pane-other','agent_status': 'done'}]}}
         with patch.object(m, 'herdr_json', return_value=snapshot) as herdr, patch.object(m, 'sensor', side_effect=[RuntimeError('单个故障'), {}]) as sensor, patch.object(m.time, 'sleep', side_effect=KeyboardInterrupt):
             with self.assertRaises(KeyboardInterrupt): m.daemon()
         self.assertEqual(herdr.call_count, 1)
         self.assertEqual(sensor.call_count, 2)
         self.assertIn('observed', sensor.call_args.kwargs)
         self.assertEqual(m.registry()['agents']['worker']['lifecycle'], 'BUSY')
+        herdr.assert_called_once_with(['agent','list'],timeout=15,session='relay-test-session')
 
     def test_sync_does_not_settle_old_task_after_same_name_instance_replacement(self):
         self.seed()
@@ -310,7 +342,7 @@ class ReliabilityRegressionTests(unittest.TestCase):
                 patch.object(m.time, 'sleep', side_effect=KeyboardInterrupt):
             with self.assertRaises(KeyboardInterrupt):
                 m.daemon()
-        herdr.assert_called_once_with(['agent', 'list'], timeout=15)
+        herdr.assert_called_once_with(['agent', 'list'], timeout=15, session='relay-test-session')
         sensor.assert_called_once()
         self.assertEqual(sensor.call_args.kwargs['observed']['tab_id'], 'tab-old')
 
