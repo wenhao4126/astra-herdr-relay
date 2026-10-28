@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from test_relay import approved_test_task, m, seed_agent
+from test_relay import approved_test_task, fake_herdr_json, m, seed_agent
 
 
 class FlowRegressionTests(unittest.TestCase):
@@ -16,6 +16,7 @@ class FlowRegressionTests(unittest.TestCase):
         for key in ('STATE', 'REGISTRY', 'TASKS', 'EVENTS', 'SEMANTIC', 'REVIEWS', 'LOCKS'):
             self.enterContext(patch.object(m, key, root / key))
         self.enterContext(patch.object(m, 'HERDR_SESSION', 'relay-test-session'))
+        self.enterContext(patch.object(m, 'herdr_json', side_effect=fake_herdr_json))
         seed_agent()
         m.ensure()
         self.enterContext(patch.object(m, 'agent_status_obj', return_value={'result': {'agent': {
@@ -46,13 +47,22 @@ class FlowRegressionTests(unittest.TestCase):
 
     def test_semantic_completion_does_not_unlock_running_agent(self):
         for runtime in ('working', 'unknown'):
-            with self.subTest(runtime=runtime), patch.object(m, 'agent_status_obj', return_value={'result': {'agent': {
-                    'name':'worker','tab_id':'tab-worker','pane_id':'pane-worker','status':runtime}}}), patch.object(m, 'review', return_value={'route': 'PASS'}) as review:
-                state = m.delegate('worker', approved_test_task(m.STATE))
-                self.assertEqual(state['final_state'], 'UNKNOWN')
-                review.assert_not_called()
-                self.assertEqual(m.registry()['agents']['worker']['lifecycle'], 'BUSY')
-                self.assertTrue((m.LOCKS / 'worker.lock').exists())
+            with self.subTest(runtime=runtime):
+                calls={'get':0}
+                def get_agent(args,timeout=60,session=None):
+                    if args[:2]==['agent','get']:
+                        calls['get']+=1
+                        status='idle' if calls['get']==1 else runtime
+                        return {'result':{'agent':{'name':'worker','tab_id':'tab-worker',
+                            'pane_id':'pane-worker','agent_status':status}}}
+                    return fake_herdr_json(args,timeout=timeout,session=session)
+                with patch.object(m,'herdr_json',side_effect=get_agent), \
+                     patch.object(m,'review',return_value={'route':'PASS'}) as review:
+                    state = m.delegate('worker', approved_test_task(m.STATE))
+                    self.assertEqual(state['final_state'], 'UNKNOWN')
+                    review.assert_not_called()
+                    self.assertEqual(m.registry()['agents']['worker']['lifecycle'], 'BUSY')
+                    self.assertTrue((m.LOCKS / 'worker.lock').exists())
             (m.LOCKS / 'worker.lock').unlink()
             seed_agent()
 
@@ -204,7 +214,7 @@ class FlowRegressionTests(unittest.TestCase):
         lock = m.acquire_agent_lock('worker', task_id)
         m.write_json(m.TASKS / (task_id + '.json'), {
             'task_id': task_id, 'agent': 'worker', 'phase': 'RUNNING',
-            'finalize_owner': token,
+            'finalize_owner': token, 'error': '原有结算错误',
         })
         with patch.object(m, 'herdr_json', return_value={}):
             result = m.release('worker')
@@ -212,4 +222,19 @@ class FlowRegressionTests(unittest.TestCase):
         self.assertFalse(lock.exists())
         task = m.read_json(m.TASKS / (task_id + '.json'), {})
         self.assertEqual(task['phase'], 'HUMAN_REVIEW')
+        self.assertEqual(task['error'], '原有结算错误')
         self.assertNotIn('finalize_owner', task)
+
+    def test_release_preserves_terminal_blocked_unknown_and_rework_without_finalize_token(self):
+        for final_state in ('BLOCKED','UNKNOWN','REWORK'):
+            with self.subTest(final_state=final_state):
+                task_id='relay-release-'+final_state.lower()
+                record={'name':'worker','lifecycle':'BUSY','tab_id':'old-tab','pane_id':'old-pane',
+                        'herdr_session':'relay-test-session','current_task_id':task_id}
+                task={'task_id':task_id,'agent':'worker','phase':final_state,
+                      'final_state':final_state,'error':'保留原有错误'}
+                m.save_registry({'agents':{'worker':record}})
+                m.write_json(m.TASKS/(task_id+'.json'),task)
+                with patch.object(m,'herdr_json',return_value={}):
+                    m.release('worker')
+                self.assertEqual(m.read_json(m.TASKS/(task_id+'.json'),{}),task)

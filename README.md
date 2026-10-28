@@ -55,6 +55,42 @@ Ordinary REWORK is bounded by `ASTRA_RELAY_MAX_REWORKS=2`. `DEEP_REVIEW` remains
 
 Probability validation rejects booleans (`true`/`false`) even though Python normally treats bool as int. Explicit implementation-defect/missing-requirement signals can force REWORK.
 
+### 结构化任务门禁
+
+所有派发入口都要求完整任务包 JSON；旧的自由文本 `delegate`、`dispatch-opaque` 和 Hook `spawn_agent.message` 不再作为任务内容接受。任务摘要使用规范 JSON SHA-256，并绑定当前规则版本。先对任务文件运行一次 Jev 评估，再使用完全相同的文件或消息派发：
+
+```json
+{
+  "schema_version": 1,
+  "task_id": "relay-readme-example",
+  "revision": 1,
+  "goal": "在指定范围完成实现并提交验证证据",
+  "scope": {"allowed": ["lib/relay.py", "tests/"], "forbidden": ["真实配置", "其他项目"]},
+  "behavior": {
+    "inputs": ["本任务包及仓库现状"],
+    "outputs": ["实现结果和测试证据"],
+    "errors": ["输入不合法时明确拒绝"],
+    "compatibility": ["保留未授权范围外的行为"]
+  },
+  "acceptance": ["指定测试通过", "提交结果包含可核查证据"],
+  "evidence_policy": ["记录实际执行的命令和结果"],
+  "docs": [],
+  "working_directory": "/home/wen/projects/astra-herdr-relay-next"
+}
+```
+
+将 `working_directory` 改成要处理的、已存在且规范化的真实绝对目录。操作链如下：
+
+```bash
+astra-relay validate-task --task-file /tmp/relay-task.json
+astra-relay evaluate-task --task-file /tmp/relay-task.json
+astra-relay validate-task --task-file /tmp/relay-task.json --require-approved
+astra-relay dispatch-task --task-file /tmp/relay-task.json --role fixer \
+  --session "$ASTRA_HERDR_SESSION" --request-id req-relay-readme-example
+```
+
+当前 Jev 门禁以五维 Score（权重 20/20/25/15/20，总分至少 95）和五项 Choice 阻断检查组成；每项阻断必须为 `absent` 且置信度至少 0.95。缺字段、类型错误、非有限数值、越界分数、接口异常或任何未知阻断均拒绝。判定凭证由 Relay 本地按任务摘要、规则版本和模型版本保存。`docs` 目前只把调用方声明的来源、版本和 SHA-256 纳入任务包摘要；此版本没有实现完整 Context7 拉取、来源验证和资料快照协议，不应据此宣称完整 Relay 架构已经完成。
+
 ### 可选的最终审查门
 
 将 `ASTRA_RELAY_FINAL_REVIEW_ENABLED=1` 写入 Relay 配置后，Astra 才会在显式调用 `finalize <task_id>` 时进入最终审查门。运行中的 Jev Sensor 和 v0.5.0 旧 Reviewer 均保持原行为。最终审查先取得独立 OCR 的 `ReviewResult`，再将其作为证据交给 Jev 判断。OCR 不启动 Agent、不修改代码，也不接收 Claude 的结论。
@@ -63,12 +99,14 @@ Probability validation rejects booleans (`true`/`false`) even though Python norm
 
 ```bash
 astra-agent-spawn --role reviewer --kind opencode --cwd /path/to/repo --name opencode-reviewer
-astra-relay dispatch-opaque opencode-reviewer --prompt-file /tmp/opencode-review-task.txt
+astra-relay validate-task --task-file /tmp/opencode-review-task.json
+astra-relay evaluate-task --task-file /tmp/opencode-review-task.json
+astra-relay dispatch-opaque opencode-reviewer --task-file /tmp/opencode-review-task.json --request-id req-opencode-review
 astra-agent-status opencode-reviewer
-herdr agent read opencode-reviewer --source recent-unwrapped --lines 400
+herdr agent read <verified-pane-id> --source recent-unwrapped --lines 400
 ```
 
-`dispatch-opaque` 返回真实任务编号，Astra 应在 reviewer 停止后用该编号收集审查结果，核对当前任务标记和实际发现，再整理成 `development_review` 的 `ReviewResult`。reviewer 发现阻塞问题时，Astra 将具体发现交回 Codex 修复，修复后重新取得独立审查结果；Relay 不会自动派发修复。多个 Herdr 会话并存时，在配置中设置 `ASTRA_HERDR_SESSION` 指向用户正在看的会话；创建标签使用 `--no-focus`，不会抢用户当前输入焦点。reviewer 首次启动若返回 `BLOCKED` 或 `agent_not_ready`，标签会保留，需用户在该标签完成首次授权或初始化，再由 Astra 确认其已就绪。
+`dispatch-opaque` 返回真实任务编号，Astra 应在 reviewer 停止后用该编号收集审查结果，核对当前任务标记和实际发现，再整理成 `development_review` 的 `ReviewResult`。reviewer 发现阻塞问题时，Astra 将具体发现交回 Codex 修复，修复后重新取得独立审查结果；Relay 不会自动派发修复。复用代理前会显式查询目标 Herdr session 的 `agent get`，核对名称、tab、pane 和可得的 `agent_session.value`；缺失身份、实例替换或未知状态均拒绝派发。多个 Herdr 会话并存时，在配置中设置 `ASTRA_HERDR_SESSION` 指向用户正在看的会话；创建标签使用 `--no-focus`，不会抢用户当前输入焦点。reviewer 首次启动若没有明确 `idle`/`done` 身份响应，会返回 `NOT_READY` 或 `UNKNOWN`，不会误标成 `IDLE`。
 
 最终审查前，Astra 将开发 Review、测试、构建、检查的四份 PASS 结果写入 JSON 文件，执行 `astra-relay record-final-evidence <task_id> --json-file <file>`。Review 字段优先使用 `development_review`；旧调用仍可使用 `claude_review`：
 
@@ -95,7 +133,7 @@ cd astra-herdr-relay-v0.5.0-fixed-20260923
 
 上面的命令使用当前源码目录；不要从同层旧 `.tar.zst` 解压后安装本次优化。安装会修改用户目录中的程序和服务，执行前先确认 Relay 没有活动任务。当前源码的修改没有自动安装到本机。
 
-`--check` 只运行预检，不修改目标目录。`uninstall.sh` 与 `rollback.sh` 也支持 `--root <目录>` 和 `--check`；默认 root 是当前用户的 HOME。`rollback.sh` 必须给出 `--backup-id`，有效 ID 先由 `rollback.sh list-backups` 列出。只有当前安装账本对应的回滚点适用于当前版本链；工具不会猜测备份或接受任意路径。
+`--check` 只运行预检，不修改目标目录。`uninstall.sh` 与 `rollback.sh` 也支持 `--root <目录>` 和 `--check`；默认 root 是当前用户的 HOME。使用真实 user systemd runner 时，`--root` 必须等于当前 HOME；非 HOME root 仅允许通过注入的隔离 fake runner 测试，CLI 会在查询服务前拒绝，以免程序文件与 unit 实际路径错配。`rollback.sh` 必须给出 `--backup-id`，有效 ID 先由 `rollback.sh list-backups` 列出。只有当前安装账本对应的回滚点适用于当前版本链；工具不会猜测备份或接受任意路径。
 
 每次成功安装都会在 `~/.local/state/astra-herdr-relay/install-ledgers/` 保存私有安装账本，并在 `install-backups/<backup-id>/` 保存受管程序原快照。卸载只在程序 SHA-256 仍与账本一致时删除本 Relay 安装的程序与 unit；用户修改过的受管文件会让操作在停服务前拒绝。卸载移除账本记录的 Relay Hook 规则和 AGENTS 标记块，保留其他 Hook、用户文档、配置、密钥、运行状态、任务锁、事件、registry 和备份。当前版本不提供 purge。
 
@@ -118,7 +156,7 @@ cd astra-herdr-relay-v0.5.0-fixed-20260923
 ```bash
 astra-agent-spawn --role fixer --kind codex --cwd ~/project
 astra-agent-spawn --role reviewer --cwd ~/project --parent-task-id relay-parent-1
-astra-delegate codex-fixer-01 "Fix the installer bug and verify it."
+astra-relay delegate codex-fixer-01 --task-file /tmp/relay-task.json --request-id req-relay-delegate
 astra-relay semantic-status codex-fixer-01
 astra-agent-status codex-fixer-01
 astra-agent-list
@@ -129,11 +167,15 @@ astra-relay sync
 异步任务完成后，Astra 可以显式审查对应任务：
 
 ```bash
-astra-relay dispatch-opaque codex-fixer-01 --prompt-file /tmp/relay-task.txt
+astra-relay validate-task --task-file /tmp/relay-task.json
+astra-relay evaluate-task --task-file /tmp/relay-task.json
+astra-relay validate-task --task-file /tmp/relay-task.json --require-approved
+astra-relay dispatch-task --task-file /tmp/relay-task.json --role fixer \
+  --session "$ASTRA_HERDR_SESSION" --request-id req-relay-async-task
 astra-relay finalize relay-任务编号
 ```
 
-`dispatch-opaque` 返回实际 `task_id`，把它传给 `finalize`。`finalize` 只审查能确认属于该任务且已停止的证据；运行中、缺少证据或实例身份无法确认时不会返回 `DONE`。`REWORK` 交回 Astra 决定，Relay 不会因这个结果自动派发新任务。守护进程只观察，不自动调用 `finalize`。
+`dispatch-task` 返回实际 `task_id`，把它传给 `finalize`。`finalize` 只审查能确认属于该任务且已停止的证据；运行中、缺少证据或实例身份无法确认时不会返回 `DONE`。`REWORK` 交回 Astra 决定，Relay 不会因这个结果自动派发新任务。守护进程只观察，不自动调用 `finalize`。Hook 入口的 `spawn_agent.message` 必须是同一份任务包 JSON，工作目录须与 Hook 当前目录相同；需要跨目录授权时使用上述 CLI `--task-file` 入口。
 
 派发时 Relay 会在原始任务前加入一段固定协议说明，原始任务正文保持不变。Agent 完成后，最终回复的第一行应写 `[RELAY FINISHED <task_id>]`，下一行起写实际结果与验证证据，其中 `<task_id>` 要换成派发返回的编号。终端只有派发回显、旧任务文本或空的完成标记时，`finalize` 会交给人工核实；没有当前任务完成标记的旧任务记录也会保守处理。
 

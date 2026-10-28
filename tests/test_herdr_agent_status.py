@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from test_relay import approved_test_task, m, seed_agent
+from test_relay import approved_test_task, fake_herdr_json, m, seed_agent
 
 
 class HerdrAgentStatusTests(unittest.TestCase):
@@ -14,6 +14,7 @@ class HerdrAgentStatusTests(unittest.TestCase):
         for key in ('STATE', 'REGISTRY', 'TASKS', 'EVENTS', 'SEMANTIC', 'REVIEWS', 'LOCKS'):
             self.enterContext(patch.object(m, key, root / key))
         self.enterContext(patch.object(m,"HERDR_SESSION","relay-test-session"))
+        self.enterContext(patch.object(m,"herdr_json",side_effect=fake_herdr_json))
         seed_agent()
         m.ensure()
         self.markers = []

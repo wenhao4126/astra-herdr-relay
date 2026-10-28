@@ -85,17 +85,30 @@ class ConcurrencyRegressionTests(unittest.TestCase):
         ctx = multiprocessing.get_context('fork')
         entered, resume = ctx.Event(), ctx.Event()
         def child():
-            def external(*args, **kwargs):
-                entered.set()
-                if not resume.wait(8): raise RuntimeError('等待超时')
-                return {'result': {'tab': {'tab_id': 't'}, 'root_pane': {'pane_id': 'p'}}}
+            def external(args, **kwargs):
+                if args[:2]==['tab','list']:
+                    entered.set()
+                    if not resume.wait(8): raise RuntimeError('等待超时')
+                    return {'result':{'tabs':[]}}
+                if args[:2]==['tab','create']:
+                    return {'result': {'tab': {'tab_id': 't'}, 'root_pane': {'pane_id': 'p'}}}
+                if args[:2] in (['agent','start'],['agent','get']):
+                    return {'result':{'agent':{'name':'worker','tab_id':'t','pane_id':'p','agent_status':'idle'}}}
+                return {'result':{}}
             with patch.object(m, 'herdr_json', side_effect=external):
                 m.spawn('worker', '/tmp', name='worker',session='relay-test-session')
         process = ctx.Process(target=child)
         process.start()
         self.addCleanup(lambda: process.kill() if process.is_alive() else None)
         self.assertTrue(entered.wait(3))
-        with patch.object(m, 'herdr_json', return_value={'result': {'tab': {'tab_id': 't2'}, 'root_pane': {'pane_id': 'p2'}}}) as external:
+        def second_agent(args,**kwargs):
+            if args[:2]==['tab','list']: return {'result':{'tabs':[]}}
+            if args[:2]==['tab','create']:
+                return {'result':{'tab':{'tab_id':'t2'},'root_pane':{'pane_id':'p2'}}}
+            if args[:2] in (['agent','start'],['agent','get']):
+                return {'result':{'agent':{'name':'other','tab_id':'t2','pane_id':'p2','agent_status':'idle'}}}
+            return {'result':{}}
+        with patch.object(m, 'herdr_json', side_effect=second_agent) as external:
             with self.assertRaises(SystemExit): m.spawn('worker', '/tmp', name='worker',session='relay-test-session')
             external.assert_not_called()
             m.spawn('worker', '/tmp', name='other',session='relay-test-session')

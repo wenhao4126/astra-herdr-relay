@@ -2,7 +2,7 @@
 from __future__ import annotations
 import copy, fcntl, tempfile
 from contextlib import contextmanager
-import argparse, json, os, re, subprocess, sys, time, urllib.request, urllib.error, uuid
+import argparse, json, math, os, re, stat, subprocess, sys, time, urllib.request, urllib.error, uuid
 from pathlib import Path
 from typing import Any
 
@@ -102,29 +102,103 @@ def _request_id(value=None):
 
 @contextmanager
 def request_claim(request_id,operation,task_sha256,target):
-    ensure()
     request_id=_request_id(request_id)
+    if STATE.is_symlink() or REQUESTS.is_symlink():
+        raise gates.GateError("REQUEST_RECORD_INVALID","request state 路径不能是符号链接")
+    if (STATE.exists() and not STATE.is_dir()) or (REQUESTS.exists() and not REQUESTS.is_dir()):
+        raise gates.GateError("REQUEST_RECORD_INVALID","request state 路径不是普通目录")
+    ensure()
+    try:
+        state_root=STATE.resolve(strict=True)
+        request_root=REQUESTS.resolve(strict=True)
+        if request_root.parent!=state_root:
+            raise gates.GateError("REQUEST_RECORD_INVALID","request 目录越出 Relay state")
+    except OSError as exc:
+        raise gates.GateError("REQUEST_RECORD_INVALID","request 目录无法安全确认") from exc
     path=REQUESTS/(request_id+".json")
     lock_path=REQUESTS/(request_id+".lock")
-    with lock_path.open("a",encoding="utf-8") as lock:
-        os.chmod(lock_path,0o600)
-        fcntl.flock(lock,fcntl.LOCK_EX)
-        existing=read_json(path,None)
-        if existing is not None:
-            if any(existing.get(key)!=value for key,value in {
+    for candidate in (path,lock_path):
+        try: candidate.resolve(strict=False).relative_to(request_root)
+        except (OSError,RuntimeError,ValueError) as exc:
+            raise gates.GateError("REQUEST_RECORD_INVALID","request 文件路径越界") from exc
+        if candidate.is_symlink():
+            raise gates.GateError("REQUEST_RECORD_INVALID","request 文件不能是符号链接")
+    try:
+        fd=os.open(lock_path,os.O_CREAT|os.O_RDWR|getattr(os,"O_NOFOLLOW",0),0o600)
+    except OSError as exc:
+        raise gates.GateError("REQUEST_RECORD_INVALID","request 锁文件无法安全打开") from exc
+    try:
+        info=os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink!=1:
+            raise gates.GateError("REQUEST_RECORD_INVALID","request 锁必须是独立普通文件")
+        os.fchmod(fd,0o600)
+        with os.fdopen(fd,"a",encoding="utf-8",closefd=False) as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX)
+            if path.exists() or path.is_symlink():
+                if path.is_symlink() or not path.is_file():
+                    raise gates.GateError("REQUEST_RECORD_INVALID","request 记录不是普通文件")
+                try:
+                    if path.resolve(strict=True).parent!=request_root:
+                        raise gates.GateError("REQUEST_RECORD_INVALID","request 记录路径越界")
+                    record_fd=os.open(path,os.O_RDONLY|getattr(os,"O_NOFOLLOW",0))
+                    try:
+                        record_info=os.fstat(record_fd)
+                        if not stat.S_ISREG(record_info.st_mode) or record_info.st_nlink!=1:
+                            raise gates.GateError("REQUEST_RECORD_INVALID","request 记录必须是独立普通文件")
+                        with os.fdopen(record_fd,"r",encoding="utf-8",closefd=False) as record_file:
+                            def reject_constant(_value):
+                                raise ValueError("JSON 非有限常量无效")
+                            def unique_object(pairs):
+                                result={}
+                                for key,value in pairs:
+                                    if key in result: raise ValueError("JSON 对象键重复")
+                                    result[key]=value
+                                return result
+                            existing=json.load(record_file,parse_constant=reject_constant,
+                                               object_pairs_hook=unique_object)
+                    finally:
+                        os.close(record_fd)
+                except gates.GateError:
+                    raise
+                except Exception as exc:
+                    raise gates.GateError("REQUEST_RECORD_INVALID","request 记录 JSON 损坏或不可读取") from exc
+                required_strings=("request_id","operation","task_sha256","target","status")
+                created_at=existing.get("created_at") if type(existing) is dict else None
+                operation_value=existing.get("operation") if type(existing) is dict else None
+                task_digest=existing.get("task_sha256") if type(existing) is dict else None
+                valid_strings=(type(existing) is dict and all(
+                    type(existing.get(key)) is str and
+                    (key=="task_sha256" and operation_value=="CREATE_AGENT" or
+                     bool(existing[key].strip())) for key in required_strings))
+                valid_digest=(operation_value=="CREATE_AGENT" and task_digest=="") or (
+                    type(task_digest) is str and re.fullmatch(r"[a-f0-9]{64}",task_digest) is not None)
+                valid_created_at=(type(created_at) is int or
+                                  (type(created_at) is float and math.isfinite(created_at)))
+                if (type(existing) is not dict or
+                    not valid_strings or
+                    existing.get("request_id")!=request_id or
+                    existing.get("operation") not in {"CREATE_AGENT","DELEGATE","DISPATCH","CREATE_AND_DISPATCH"} or
+                    not valid_digest or
+                    not valid_created_at or
+                    ("result" in existing and type(existing["result"]) is not dict) or
+                    ("error_code" in existing and type(existing["error_code"]) is not str)):
+                    raise gates.GateError("REQUEST_RECORD_INVALID","request 记录结构非法")
+                if any(existing.get(key)!=value for key,value in {
                 "operation":operation,"task_sha256":task_sha256,"target":target}.items()):
-                raise gates.GateError("REQUEST_ID_CONFLICT","request_id 已绑定其他任务或目标")
-            if existing.get("status") in {"PREPARED","CREATING","DISPATCHING","WAITING"}:
-                existing.update(status="UNKNOWN",error_code="REQUEST_INTERRUPTED",cached=True)
-                write_json(path,existing)
-            else:
-                existing["cached"]=True
-            yield {"claimed":False,"record":existing,"path":path}
-            return
-        record={"request_id":request_id,"operation":operation,"task_sha256":task_sha256,
-                "target":target,"status":"PREPARED","created_at":now()}
-        write_json(path,record)
-        yield {"claimed":True,"record":record,"path":path}
+                    raise gates.GateError("REQUEST_ID_CONFLICT","request_id 已绑定其他任务或目标")
+                if existing.get("status") in {"PREPARED","CREATING","DISPATCHING","WAITING"}:
+                    existing.update(status="UNKNOWN",error_code="REQUEST_INTERRUPTED",cached=True)
+                    write_json(path,existing)
+                else:
+                    existing["cached"]=True
+                yield {"claimed":False,"record":existing,"path":path}
+                return
+            record={"request_id":request_id,"operation":operation,"task_sha256":task_sha256,
+                    "target":target,"status":"PREPARED","created_at":now()}
+            write_json(path,record)
+            yield {"claimed":True,"record":record,"path":path}
+    finally:
+        os.close(fd)
 
 def finish_request(claim,status,**fields):
     record=dict(claim["record"])
@@ -357,27 +431,53 @@ def spawn(role,cwd,name=None,parent_task_id=None,kind="codex",model=None,reasoni
                     args += ["-c",f"model_reasoning_effort={reasoning}","--strict-config"]
                 start_cmd += ["--",*args]
             started=herdr_json(start_cmd,timeout=40,session=session)
-            external_agent=extract_agent(started)
-            external_session=external_agent.get("agent_session") if isinstance(external_agent,dict) else None
-            external_session=(external_session.get("value") if isinstance(external_session,dict)
-                              else external_session)
-            if type(external_session) is str and external_session.strip():
-                rec=update_agent(name,rec,{"herdr_agent_session_value":external_session})
+            # 成功退出码不等于代理就绪：start 响应必须包含真实身份和 idle/done。
+            started_agent=extract_agent(started)
+            if type(started_agent.get("agent_status")) is not str or not started_agent["agent_status"].strip():
+                raise gates.GateError("AGENT_STATUS_UNKNOWN","Herdr agent start 未返回 agent_status")
+            rec,started_agent=_validate_agent_observation(
+                name,rec,session,started,require_ready=True)
+            try:
+                rec,observed=verify_agent_instance(name,rec,session,require_ready=True)
+            except gates.GateError as status_error:
+                status=_status_for_agent_error(status_error)
+                lifecycle="BLOCKED" if status=="NOT_READY" else "UNKNOWN"
+                rec=update_agent(name,rec,{"lifecycle":lifecycle,"start_error":status_error.code})
+                event("agent_start_not_ready",agent=name,tab_id=tab_id,pane_id=pane_id,
+                      status=status,error_code=status_error.code)
+                preserve_focus(previous_focus,tab_id,session)
+                finish_request(claim,status,agent=name,tab_id=tab_id,pane_id=pane_id,
+                               instance=agent_instance(rec),
+                               herdr_agent_session_value=rec.get("herdr_agent_session_value"),
+                               stage="AGENT_START_VERIFY",error_code=status_error.code)
+                return {**rec,"request_id":request_id,"status":status,"error_code":status_error.code}
         except subprocess.TimeoutExpired:
             rec=update_agent(name,rec,{"lifecycle":"UNKNOWN","start_error":"agent_start_timeout"})
             finish_request(claim,"UNKNOWN",agent=name,tab_id=tab_id,pane_id=pane_id,
                            instance=agent_instance(rec),herdr_agent_session_value=rec.get("herdr_agent_session_value"),
                            stage="AGENT_START",error_code="HERDR_TIMEOUT")
             return {**rec,"request_id":request_id,"status":"UNKNOWN"}
+        except gates.GateError as start_error:
+            status=_status_for_agent_error(start_error)
+            lifecycle="BLOCKED" if status=="NOT_READY" else "UNKNOWN"
+            rec=update_agent(name,rec,{"lifecycle":lifecycle,"start_error":start_error.code})
+            preserve_focus(previous_focus,tab_id,session)
+            finish_request(claim,status,agent=name,tab_id=tab_id,pane_id=pane_id,
+                           instance=agent_instance(rec),
+                           herdr_agent_session_value=rec.get("herdr_agent_session_value"),
+                           stage="AGENT_START_VERIFY",error_code=start_error.code)
+            return {**rec,"request_id":request_id,"status":status,"error_code":start_error.code}
         except Exception as start_error:
             if "agent_not_ready" in str(start_error):
                 rec=update_agent(name,rec,{"lifecycle":"BLOCKED","start_error":"agent_not_ready"})
                 event("agent_start_blocked",agent=name,tab_id=tab_id,pane_id=pane_id)
                 preserve_focus(previous_focus,tab_id,session)
-                finish_request(claim,"BLOCKED",agent=name,tab_id=tab_id,pane_id=pane_id,
+                finish_request(claim,"NOT_READY",agent=name,tab_id=tab_id,pane_id=pane_id,
                                instance=agent_instance(rec),
-                               herdr_agent_session_value=rec.get("herdr_agent_session_value"))
-                return {**rec,"request_id":request_id}
+                               herdr_agent_session_value=rec.get("herdr_agent_session_value"),
+                               error_code="AGENT_NOT_READY")
+                return {**rec,"request_id":request_id,"status":"NOT_READY",
+                        "error_code":"AGENT_NOT_READY"}
             rollback_error=None
             try: herdr_json(["tab","close",tab_id],timeout=15,session=session)
             except Exception as exc: rollback_error=str(exc)
@@ -435,6 +535,21 @@ def start_review_pair(cwd):
             if actual_cwd!=expected_cwd:
                 result["errors"].append({"name":name,"error":f"agent cwd mismatch: expected {expected_cwd}, found {actual_cwd}"})
                 continue
+            if current.get("lifecycle") not in {"IDLE","READY"} or current.get("operation"):
+                result["errors"].append({"name":name,"code":"AGENT_NOT_READY",
+                                         "status":"NOT_READY","error":"代理本地状态不是空闲"})
+                continue
+            try:
+                session=agent_session(name,current)
+                current,observed=verify_agent_instance(name,current,session,require_ready=True)
+            except gates.GateError as exc:
+                result["errors"].append({"name":name,"code":exc.code,
+                                         "status":_status_for_agent_error(exc),"error":str(exc)})
+                continue
+            if current.get("lifecycle") not in {"IDLE","READY"} or current.get("operation"):
+                result["errors"].append({"name":name,"code":"AGENT_NOT_READY",
+                                         "status":"NOT_READY","error":"核验后本地代理状态已变化"})
+                continue
             actual_model=current.get("model")
             item={"name":name,"lifecycle":current.get("lifecycle"),
                   "model_status":"verified" if model is not None and actual_model==model else ("unverified" if model is None or actual_model is None else "mismatch"),
@@ -481,11 +596,15 @@ def release(name):
             _release_lock(LOCKS/f"{name}.lock",task_id)
             task_path=TASKS/f"{task_id}.json"
             task=read_json(task_path,{})
-            if (task.get("task_id")==task_id and
-                task.get("finalize_owner")==expected.get("operation")):
+            finalize_owner=task.get("finalize_owner")
+            operation=expected.get("operation")
+            if (task.get("task_id")==task_id and task.get("phase")=="RUNNING" and
+                not task.get("final_state") and expected.get("operation_kind")=="finalize" and
+                type(finalize_owner) is str and bool(finalize_owner) and
+                type(operation) is str and bool(operation) and finalize_owner==operation):
                 task.pop("finalize_owner",None)
-                task.update(phase="HUMAN_REVIEW",final_state="HUMAN_REVIEW",
-                            error="代理在结算期间被显式释放")
+                task.update(phase="HUMAN_REVIEW",final_state="HUMAN_REVIEW")
+                task.setdefault("error","代理在结算期间被显式释放")
                 write_json(task_path,task)
         current.pop("operation",None)
         current.pop("operation_kind",None)
@@ -570,6 +689,60 @@ def same_agent_instance(rec,agent,name=None,session=None):
     actual_external=observed_agent_session(agent)
     if expected_external and actual_external and expected_external!=actual_external: return False
     return True
+
+def _agent_observation_error(code,message):
+    return gates.GateError(code,message)
+
+def _validate_agent_observation(name,rec,session,obj,*,require_ready):
+    if type(obj) is not dict:
+        raise _agent_observation_error("AGENT_STATUS_UNKNOWN","Herdr agent get 未返回对象")
+    error=obj.get("error")
+    if isinstance(error,dict):
+        if error.get("code")=="agent_not_found":
+            raise _agent_observation_error("AGENT_INSTANCE_STALE","Herdr session 中已找不到此代理实例")
+        raise _agent_observation_error("AGENT_STATUS_UNKNOWN","Herdr agent get 返回未知错误")
+    agent=extract_agent(obj)
+    if any(type(agent.get(key)) is not str or not agent[key].strip()
+           for key in ("name","tab_id","pane_id")):
+        raise _agent_observation_error("AGENT_INSTANCE_UNKNOWN","Herdr agent get 缺少 name/tab/pane 身份")
+    if type(agent.get("agent_status")) is not str or not agent["agent_status"].strip():
+        raise _agent_observation_error("AGENT_STATUS_UNKNOWN","Herdr agent get 缺少 agent_status")
+    if not same_agent_instance(rec,agent,name,session):
+        raise _agent_observation_error("AGENT_INSTANCE_STALE","Herdr 返回的代理身份与 registry 不匹配")
+    runtime=runtime_status(agent)
+    if runtime=="unknown":
+        raise _agent_observation_error("AGENT_STATUS_UNKNOWN","无法确认 Herdr agent_status")
+    if require_ready and runtime not in {"idle","done"}:
+        raise _agent_observation_error("AGENT_NOT_READY",f"Herdr 代理尚未就绪：{runtime}")
+    external=observed_agent_session(agent)
+    if external and not rec.get("herdr_agent_session_value"):
+        try:
+            rec=update_agent(name,rec,{"herdr_agent_session_value":external})
+        except Exception as exc:
+            raise _agent_observation_error("AGENT_INSTANCE_STALE","核对期间 registry 实例发生变化") from exc
+    current=registry()["agents"].get(name)
+    if (not isinstance(current,dict) or agent_instance(current)!=agent_instance(rec) or
+            current.get("herdr_session")!=session or
+            (rec.get("herdr_agent_session_value") and
+             current.get("herdr_agent_session_value")!=rec.get("herdr_agent_session_value"))):
+        raise _agent_observation_error("AGENT_INSTANCE_STALE","核对期间 registry 实例发生变化")
+    return current,agent
+
+def verify_agent_instance(name,record,session,*,require_ready=True):
+    if not isinstance(record,dict) or record.get("herdr_session")!=session:
+        raise _agent_observation_error("AGENT_INSTANCE_UNKNOWN","代理缺少匹配的显式 Herdr session")
+    if any(type(record.get(key)) is not str or not record[key].strip()
+           for key in ("name","tab_id","pane_id")):
+        raise _agent_observation_error("AGENT_INSTANCE_UNKNOWN","registry 缺少代理 name/tab/pane 身份")
+    try:
+        obj=herdr_json(["agent","get",name],timeout=15,session=session)
+    except Exception as exc:
+        raise _agent_observation_error("AGENT_STATUS_UNKNOWN","Herdr agent get 失败，状态未知") from exc
+    return _validate_agent_observation(name,record,session,obj,require_ready=require_ready)
+
+def _status_for_agent_error(exc):
+    if getattr(exc,"code",None)=="AGENT_NOT_READY": return "NOT_READY"
+    return "UNKNOWN"
 
 def deterministic_semantic(runtime):
     s=(runtime or "").lower()
@@ -861,10 +1034,12 @@ def _release_lock(p,task_id):
 def release_lock(p,task_id):
     with registry_transaction(): _release_lock(p,task_id)
 
-def begin_task(name,task_id,operation=None,operation_kind=None):
+def begin_task(name,task_id,operation=None,operation_kind=None,expected_instance=None):
     with registry_transaction() as r:
         rec=r["agents"].get(name)
         if not rec: raise SystemExit(f"unknown agent: {name}")
+        if expected_instance is not None and agent_instance(rec)!=expected_instance:
+            raise gates.GateError("AGENT_INSTANCE_STALE","派发前 registry 实例已变化")
         if rec.get("operation") or rec.get("lifecycle") not in {"IDLE","READY"}: raise SystemExit(f"agent not idle: {name}")
         _acquire_agent_lock(name,task_id)
         rec.update(lifecycle="BUSY",current_task_id=task_id,last_seen=now())
@@ -894,11 +1069,20 @@ def delegate(name,task,parent_task_id=None,request_id=None):
     with request_claim(request_id,"DELEGATE",digest,name) as claim:
         if not claim["claimed"]: return _request_cached(claim)
         rec0=registry()["agents"].get(name)
-        session=agent_session(name,rec0)
-        require_agent_task_cwd(rec0,task)
+        try:
+            session=agent_session(name,rec0)
+            require_agent_task_cwd(rec0,task)
+            rec0,verified=verify_agent_instance(name,rec0,session,require_ready=True)
+        except gates.GateError as exc:
+            status=_status_for_agent_error(exc)
+            result={"agent":name,"accepted":False,"status":status,"request_id":request_id,
+                    "error":{"code":exc.code,"message":str(exc)}}
+            finish_request(claim,status,result=result,error_code=exc.code)
+            raise
         task_id=f"relay-{uuid.uuid4().hex[:10]}"
-        rec=begin_task(name,task_id)
-        identity=agent_instance(rec); lock=LOCKS/f"{name}.lock"
+        identity=agent_instance(rec0)
+        rec=begin_task(name,task_id,expected_instance=identity)
+        lock=LOCKS/f"{name}.lock"
         marker=f"[RELAY TASK {task_id}]"
         state={"task_id":task_id,"request_id":request_id,"task_sha256":digest,
                "task_package":task,"parent_task_id":parent_task_id or rec.get("parent_task_id"),
@@ -910,13 +1094,14 @@ def delegate(name,task,parent_task_id=None,request_id=None):
         try:
             event("task_dispatch",task_id=task_id,agent=name)
             full=_task_prompt(task,marker,f"[RELAY FINISHED {task_id}]")
-            p=run(herdr_command("agent","prompt",name,full,"--wait","--timeout","300000",session=session),timeout=310,check=False)
+            p=run(herdr_command("agent","prompt",rec["pane_id"],full,"--wait","--timeout","300000",session=session),timeout=310,check=False)
             if p.returncode:
                 state.update(phase="HUMAN_REVIEW",final_state="HUMAN_REVIEW",error=p.stderr[-4000:])
                 write_json(TASKS/f"{task_id}.json",state)
                 finish_request(claim,"FAILED",result=state,error_code="HERDR_PROMPT_FAILED")
                 return state
-            runtime=runtime_status(extract_agent(agent_status_obj(name)))
+            rec,observed=verify_agent_instance(name,rec,session,require_ready=False)
+            runtime=runtime_status(observed)
             if runtime=="blocked":
                 state.update(phase="BLOCKED",final_state="BLOCKED")
                 write_json(TASKS/f"{task_id}.json",state)
@@ -928,7 +1113,7 @@ def delegate(name,task,parent_task_id=None,request_id=None):
                 finish_request(claim,"UNKNOWN",result=state,error_code="HERDR_RUNTIME_UNKNOWN")
                 return state
             settled=True
-            output=run(herdr_command("agent","read",name,"--source","recent-unwrapped","--lines","160",session=session),timeout=20,check=False)
+            output=run(herdr_command("agent","read",rec["pane_id"],"--source","recent-unwrapped","--lines","160",session=session),timeout=20,check=False)
             if output.returncode: raise RuntimeError(output.stderr or "output_read_failed")
             out=output.stdout
             if marker not in out:
@@ -939,6 +1124,15 @@ def delegate(name,task,parent_task_id=None,request_id=None):
             scoped=out[out.find(marker):]
             try: rv=review(task_id,name,canonical_json(task),scoped)
             except Exception as exc: rv={"route":"DEEP_REVIEW","error":str(exc)}
+            rec,final_observed=verify_agent_instance(name,rec,session,require_ready=False)
+            final_runtime=runtime_status(final_observed)
+            if final_runtime not in {"idle","done"}:
+                settled=False
+                state.update(phase="UNKNOWN",final_state="UNKNOWN",error="runtime_changed_before_commit",
+                             error_code="AGENT_NOT_READY")
+                write_json(TASKS/f"{task_id}.json",state)
+                finish_request(claim,"UNKNOWN",result=state,error_code="AGENT_NOT_READY")
+                return state
             state["last_review"]=rv
             if rv.get("error"): state["error"]=rv["error"]
             route=rv.get("route")
@@ -954,6 +1148,12 @@ def delegate(name,task,parent_task_id=None,request_id=None):
             write_json(TASKS/f"{task_id}.json",state)
             finish_request(claim,"UNKNOWN",result=state,error_code="HERDR_TIMEOUT")
             return state
+        except gates.GateError as exc:
+            settled=False
+            state.update(phase="UNKNOWN",final_state="UNKNOWN",error=str(exc),error_code=exc.code)
+            write_json(TASKS/f"{task_id}.json",state)
+            finish_request(claim,"UNKNOWN",result=state,error_code=exc.code)
+            return state
         except Exception as exc:
             state.update(phase="HUMAN_REVIEW",final_state="HUMAN_REVIEW",error=str(exc))
             write_json(TASKS/f"{task_id}.json",state)
@@ -963,7 +1163,14 @@ def delegate(name,task,parent_task_id=None,request_id=None):
             if settled:
                 with registry_transaction() as r:
                     current=r["agents"].get(name)
-                    if current and agent_instance(current)==identity and current.get("lifecycle")=="BUSY" and current.get("current_task_id")==task_id:
+                    if not current or agent_instance(current)!=identity or (
+                            rec.get("herdr_agent_session_value") and
+                            current.get("herdr_agent_session_value")!=rec.get("herdr_agent_session_value")):
+                        state.update(phase="UNKNOWN",final_state="UNKNOWN",error="agent_instance_changed_before_commit",
+                                     error_code="AGENT_INSTANCE_STALE")
+                        write_json(TASKS/f"{task_id}.json",state)
+                        finish_request(claim,"UNKNOWN",result=state,error_code="AGENT_INSTANCE_STALE")
+                    elif current.get("lifecycle")=="BUSY" and current.get("current_task_id")==task_id:
                         current.update(lifecycle="IDLE",last_task_id=task_id,current_task_id=None,last_seen=now())
                         _release_lock(lock,task_id)
 
@@ -977,51 +1184,98 @@ def dispatch_opaque(name,task,parent_task_id=None,request_id=None):
     require_agent_task_cwd(rec0,task)
     with request_claim(request_id,"DISPATCH",digest,name) as claim:
         if not claim["claimed"]: return _request_cached(claim)
+        try:
+            rec0,observed=verify_agent_instance(name,rec0,session,require_ready=True)
+        except gates.GateError as exc:
+            status=_status_for_agent_error(exc)
+            result={"agent":name,"accepted":False,"status":status,"request_id":request_id,
+                    "error":{"code":exc.code,"message":str(exc)}}
+            finish_request(claim,status,result=result,error_code=exc.code)
+            return result
         task_id=f"relay-{uuid.uuid4().hex[:10]}"
         token=uuid.uuid4().hex
-        rec=begin_task(name,task_id,operation=token,operation_kind="dispatch")
+        identity=agent_instance(rec0)
+        try:
+            rec=begin_task(name,task_id,operation=token,operation_kind="dispatch",
+                           expected_instance=identity)
+        except gates.GateError as exc:
+            status=_status_for_agent_error(exc)
+            result={"agent":name,"accepted":False,"status":status,"request_id":request_id,
+                    "error":{"code":exc.code,"message":str(exc)}}
+            finish_request(claim,status,result=result,error_code=exc.code)
+            return result
         marker=f"[RELAY TASK {task_id}]"; completion_marker=f"[RELAY FINISHED {task_id}]"
         state={"task_id":task_id,"request_id":request_id,"task_sha256":digest,
                "task_package":task,"parent_task_id":parent_task_id or rec.get("parent_task_id"),
                "agent":name,"phase":"RUNNING","requirement":canonical_json(task),
                "created_at":now(),"dispatch_mode":"opaque_async","marker":marker,
                "completion_marker":completion_marker,"instance":agent_instance(rec),
-               "herdr_session":session}
+               "herdr_session":session,
+               "herdr_agent_session_value":rec.get("herdr_agent_session_value")}
         write_json(TASKS/f"{task_id}.json",state)
         finish_request(claim,"DISPATCHING",task_id=task_id,herdr_session=session)
         try:
-            proc=run(herdr_command("agent","prompt",name,_task_prompt(task,marker,completion_marker),session=session),timeout=20,check=False)
+            proc=run(herdr_command("agent","prompt",rec["pane_id"],
+                                   _task_prompt(task,marker,completion_marker),session=session),
+                     timeout=20,check=False)
             if proc.returncode:
                 state.update(phase="HUMAN_REVIEW",error=proc.stderr or proc.stdout or f"prompt rc={proc.returncode}")
-                finish_request(claim,"FAILED",error_code="HERDR_PROMPT_FAILED",task_id=task_id)
                 result={"agent":name,"task_id":task_id,"task_sha256":digest,"accepted":False,
                         "status":"FAILED","request_id":request_id,"error":{"code":"HERDR_PROMPT_FAILED","message":state["error"]}}
             else:
-                state["dispatch_confirmed"]=True
-                finish_request(claim,"DISPATCHED",task_id=task_id)
-                result={"agent":name,"task_id":task_id,"task_sha256":digest,"accepted":True,
-                        "status":"DISPATCHED","request_id":request_id}
-            write_json(TASKS/f"{task_id}.json",state)
+                rec,observed=verify_agent_instance(name,rec,session,require_ready=False)
+                runtime=runtime_status(observed)
+                if runtime in {"starting","blocked"}:
+                    state.update(phase="BLOCKED",final_state="BLOCKED",error=f"agent_not_ready:{runtime}")
+                    result={"agent":name,"task_id":task_id,"task_sha256":digest,"accepted":False,
+                            "status":"NOT_READY","request_id":request_id,
+                            "error":{"code":"AGENT_NOT_READY","message":state["error"]}}
+                elif runtime not in {"working","idle","done"}:
+                    state.update(phase="UNKNOWN",final_state="UNKNOWN",error="runtime_status_unknown")
+                    result={"agent":name,"task_id":task_id,"task_sha256":digest,"accepted":False,
+                            "status":"UNKNOWN","request_id":request_id,
+                            "error":{"code":"AGENT_STATUS_UNKNOWN","message":state["error"]}}
+                else:
+                    state["dispatch_confirmed"]=True
+                    result={"agent":name,"task_id":task_id,"task_sha256":digest,"accepted":True,
+                            "status":"DISPATCHED","request_id":request_id}
         except subprocess.TimeoutExpired:
             state.update(phase="UNKNOWN",error="Herdr 请求超时，状态未知；未重放")
-            write_json(TASKS/f"{task_id}.json",state)
-            finish_request(claim,"UNKNOWN",task_id=task_id,error_code="HERDR_TIMEOUT")
             result={"agent":name,"task_id":task_id,"task_sha256":digest,"accepted":False,
                     "status":"UNKNOWN","request_id":request_id,
                     "error":{"code":"HERDR_TIMEOUT","message":"Herdr 请求超时，状态未知；未重放"}}
         except Exception as exc:
-            state.update(phase="HUMAN_REVIEW",error=str(exc))
-            write_json(TASKS/f"{task_id}.json",state)
-            finish_request(claim,"FAILED",task_id=task_id,error_code="HERDR_PROMPT_FAILED")
-            result={"agent":name,"task_id":task_id,"task_sha256":digest,"accepted":False,
-                    "status":"FAILED","request_id":request_id,
-                    "error":{"code":"HERDR_PROMPT_FAILED","message":str(exc)}}
+            if isinstance(exc,gates.GateError):
+                status=_status_for_agent_error(exc)
+                phase="UNKNOWN" if status=="UNKNOWN" else "BLOCKED"
+                state.update(phase=phase,final_state=phase,error=str(exc),error_code=exc.code)
+                result={"agent":name,"task_id":task_id,"task_sha256":digest,"accepted":False,
+                        "status":status,"request_id":request_id,
+                        "error":{"code":exc.code,"message":str(exc)}}
+            else:
+                state.update(phase="HUMAN_REVIEW",error=str(exc))
+                result={"agent":name,"task_id":task_id,"task_sha256":digest,"accepted":False,
+                        "status":"FAILED","request_id":request_id,
+                        "error":{"code":"HERDR_PROMPT_FAILED","message":str(exc)}}
         with registry_transaction() as r:
             current=r["agents"].get(name,{})
-            if current.get("operation")==token and agent_instance(current)==state["instance"]:
+            if (agent_instance(current)!=state["instance"] or current.get("herdr_session")!=session or
+                    (state.get("herdr_agent_session_value") and
+                     current.get("herdr_agent_session_value")!=state["herdr_agent_session_value"])):
+                state.update(phase="UNKNOWN",final_state="UNKNOWN",error="agent_instance_changed_before_commit",
+                             error_code="AGENT_INSTANCE_STALE",dispatch_confirmed=False)
+                result={"agent":name,"task_id":task_id,"task_sha256":digest,"accepted":False,
+                        "status":"UNKNOWN","request_id":request_id,
+                        "error":{"code":"AGENT_INSTANCE_STALE","message":state["error"]}}
+            elif current.get("operation")==token:
                 current.pop("operation",None); current.pop("operation_kind",None)
+        write_json(TASKS/f"{task_id}.json",state)
         record=read_json(claim["path"],{})
-        record["result"]=result; write_json(claim["path"],record)
+        record["result"]=result
+        record["status"]=result["status"]
+        record["updated_at"]=now()
+        if result.get("error"): record["error_code"]=result["error"]["code"]
+        write_json(claim["path"],record)
         return result
 
 def dispatch_task(task,role,name=None,kind="codex",model=None,reasoning=None,

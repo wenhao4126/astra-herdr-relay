@@ -515,8 +515,11 @@ def _mutate_owned_hooks(path, expected, replacement, *, preserve_empty=True):
     if data:
         _atomic_write(path, (json.dumps(data, ensure_ascii=False, indent=2) + "\n").encode(),
                       stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o600)
-    elif path.exists() and (not preserve_empty or not existed):
-        path.unlink()
+    elif path.exists():
+        if preserve_empty and existed:
+            _atomic_write(path, b"{}\n", stat.S_IMODE(path.stat().st_mode))
+        else:
+            path.unlink()
     return added
 
 
@@ -540,6 +543,8 @@ def _verify_owned_programs(root, ledger):
 
 
 def _preflight(root, runner, proc_root):
+    if runner is subprocess.run and Path(root).expanduser().resolve() != Path.home().resolve():
+        raise InstallError("真实 user systemd 操作的 --root 必须等于当前用户 HOME；非 HOME root 仅支持隔离 fake runner")
     _registry_preflight(root)
     service = _service_state(runner)
     processes = _relay_processes(Path(proc_root), root,

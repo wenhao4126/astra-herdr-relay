@@ -5,6 +5,8 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+import subprocess
+from unittest.mock import patch
 
 PROJECT = Path(__file__).parents[1]
 INSTALLER = PROJECT / "lib" / "install.py"
@@ -192,6 +194,36 @@ class InstallTests(unittest.TestCase):
         self.assertFalse((self.home / ".config/systemd/user/astra-herdr-relay.service").exists())
         self.assertFalse(self.systemd.active or self.systemd.enabled)
         self.assertTrue((self.home / ".local/state/astra-herdr-relay/install-backups" / installed["backup_id"]).is_dir())
+
+    def test_uninstall_preserves_empty_hooks_objects_and_user_rules(self):
+        fragment=json.loads((self.source/"hooks/hooks.fragment.json").read_text())
+        relay_only={"hooks":fragment["hooks"]}
+        user_rule={"matcher":"UserTool","hooks":[{"type":"command","command":"echo user"}]}
+        cases=(
+            ("empty_object",{},{}),
+            ("relay_only",relay_only,{}),
+            ("user_rule",{"hooks":{"PreToolUse":[user_rule]}},{"hooks":{"PreToolUse":[user_rule]}}),
+        )
+        for label,before,expected in cases:
+            with self.subTest(hooks=label):
+                path=self.home/".codex/hooks.json"
+                path.parent.mkdir(parents=True,exist_ok=True)
+                path.write_text(json.dumps(before),encoding="utf-8")
+                self.install()
+                self.installer.uninstall(self.home,runner=self.systemd,proc_root=self.proc)
+                self.assertTrue(path.is_file())
+                self.assertEqual(json.loads(path.read_text()),expected)
+
+    def test_first_install_rollback_preserves_preexisting_empty_hooks_object(self):
+        path=self.home/".codex/hooks.json"
+        path.parent.mkdir(parents=True,exist_ok=True)
+        path.write_text("{}\n",encoding="utf-8")
+        installed=self.install()
+        result=self.installer.rollback(self.home,installed["backup_id"],
+                                       runner=self.systemd,proc_root=self.proc)
+        self.assertIsNone(result["restored_install_id"])
+        self.assertTrue(path.is_file())
+        self.assertEqual(json.loads(path.read_text()),{})
 
     def test_rollback_upgrade_restores_previous_program_and_keeps_new_user_data(self):
         first = self.install()
@@ -386,6 +418,12 @@ class InstallTests(unittest.TestCase):
         before = sorted(str(p.relative_to(self.home)) for p in self.home.rglob("*"))
         self.assertEqual(self.install(check=True)["mode"], "check")
         self.assertEqual(sorted(str(p.relative_to(self.home)) for p in self.home.rglob("*")), before)
+
+    def test_real_systemd_runner_rejects_non_home_root_before_service_query(self):
+        with patch.object(self.installer,"_service_state") as service:
+            with self.assertRaisesRegex(self.installer.InstallError,"--root 必须等于当前用户 HOME"):
+                self.installer._preflight(self.home,subprocess.run,self.proc)
+        service.assert_not_called()
 
     def test_unknown_service_transition_state_refuses_maintenance(self):
         class UnknownService:

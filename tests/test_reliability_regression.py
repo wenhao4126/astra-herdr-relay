@@ -3,7 +3,7 @@ import subprocess
 import unittest
 from unittest.mock import patch
 import test_event_regression
-from test_relay import m
+from test_relay import m, real_herdr_json
 
 
 class ReliabilityRegressionTests(unittest.TestCase):
@@ -213,9 +213,10 @@ class ReliabilityRegressionTests(unittest.TestCase):
             return subprocess.CompletedProcess(cmd, 0 if cmd[-1] == 'list' else 1,
                 json.dumps({'result': {'agents': []}}) if cmd[-1] == 'list' else '',
                 '' if cmd[-1] == 'list' else json.dumps(missing))
-        with patch.object(m, 'run', side_effect=external), patch.object(m, 'now', return_value=2):
+        with patch.object(m, 'herdr_json', side_effect=real_herdr_json), \
+             patch.object(m, 'run', side_effect=external), patch.object(m, 'now', return_value=2):
             self.assertEqual(m.sync()['agents']['worker']['lifecycle'], 'BUSY')
-        with patch.object(m, 'run', side_effect=external):
+        with patch.object(m, 'herdr_json', side_effect=real_herdr_json), patch.object(m, 'run', side_effect=external):
             self.assertEqual(m.sync()['agents']['worker']['lifecycle'], 'REMOVED')
 
     def test_confirmed_orphan_moves_unsettled_task_to_human_review_and_releases_owned_lock(self):
@@ -272,8 +273,9 @@ class ReliabilityRegressionTests(unittest.TestCase):
 
     def test_stderr_transport_errors_do_not_confirm_absence(self):
         for stderr in ('权限不足', '{"error":{"code":"transport_error"}}'):
-            with patch.object(m.subprocess, 'run', return_value=subprocess.CompletedProcess([], 1, '', stderr)) as command:
-                with self.assertRaises(RuntimeError): m.herdr_json(['agent', 'get', 'worker'])
+            with patch.object(m, 'herdr_json', side_effect=real_herdr_json), \
+                 patch.object(m.subprocess, 'run', return_value=subprocess.CompletedProcess([], 1, '', stderr)) as command:
+                with self.assertRaises(RuntimeError): real_herdr_json(['agent', 'get', 'worker'])
                 self.assertTrue(command.call_args.kwargs['capture_output'])
 
     def test_cache_is_bound_to_task_instance_and_runtime(self):

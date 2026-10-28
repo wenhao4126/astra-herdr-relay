@@ -52,6 +52,145 @@ class TaskFlowTests(unittest.TestCase):
         request = m.read_json(m.STATE / "requests/req-dispatch-1.json", {})
         self.assertEqual(request["status"], "DISPATCHED")
         self.assertEqual(request["task_sha256"], first["task_sha256"])
+        self.assertEqual(external.call_args.args[0][5], "pane-test")
+
+    def test_corrupt_request_records_are_preserved_and_fail_before_herdr(self):
+        self.seed_agent()
+        task=make_task_package(m.STATE)
+        approve_test_task(task,m.STATE)
+        requests=m.STATE/"requests"
+        requests.mkdir(parents=True,exist_ok=True)
+        cases={
+            "truncated":b'{"request_id":"req-damaged",',
+            "non_object":b'[]',
+            "missing_fields":b'{"request_id":"req-damaged","status":"UNKNOWN"}',
+            "non_finite":b'{"request_id":"req-damaged","operation":"DISPATCH","task_sha256":"x","target":"worker","status":"UNKNOWN","created_at":NaN}',
+        }
+        for label,payload in cases.items():
+            with self.subTest(record=label):
+                path=requests/"req-damaged.json"
+                path.write_bytes(payload)
+                with patch.object(m,"herdr_json") as herdr, patch.object(m,"run") as external:
+                    with self.assertRaises(GateError) as error:
+                        m.dispatch_opaque("worker",task,request_id="req-damaged")
+                self.assertEqual(error.exception.code,"REQUEST_RECORD_INVALID")
+                self.assertEqual(path.read_bytes(),payload)
+                herdr.assert_not_called()
+                external.assert_not_called()
+
+    def test_symlink_request_record_is_rejected_without_external_call(self):
+        self.seed_agent()
+        task=make_task_package(m.STATE)
+        approve_test_task(task,m.STATE)
+        requests=m.STATE/"requests"
+        requests.mkdir(parents=True,exist_ok=True)
+        target=m.STATE/"outside-request.json"
+        target.write_text('{"keep":true}\n')
+        try:
+            (requests/"req-symlink.json").symlink_to(target)
+        except (OSError,NotImplementedError):
+            self.skipTest("当前文件系统不支持符号链接测试")
+        with patch.object(m,"herdr_json") as herdr, patch.object(m,"run") as external:
+            with self.assertRaises(GateError) as error:
+                m.dispatch_opaque("worker",task,request_id="req-symlink")
+        self.assertEqual(error.exception.code,"REQUEST_RECORD_INVALID")
+        self.assertEqual(target.read_text(),'{"keep":true}\n')
+        herdr.assert_not_called()
+        external.assert_not_called()
+
+    def test_dispatch_rejects_replaced_herdr_identity_before_prompt(self):
+        self.seed_agent()
+        task=make_task_package(m.STATE)
+        approve_test_task(task,m.STATE)
+        replaced={"result":{"agent":{"name":"worker","tab_id":"replacement-tab",
+                                        "pane_id":"pane-test","agent_status":"idle"}}}
+        with patch.object(m,"herdr_json",return_value=replaced) as herdr, patch.object(m,"run") as external:
+            result=m.dispatch_opaque("worker",task,request_id="req-replaced")
+        self.assertFalse(result["accepted"])
+        self.assertEqual(result["status"],"UNKNOWN")
+        self.assertEqual(result["error"]["code"],"AGENT_INSTANCE_STALE")
+        self.assertEqual(herdr.call_args.args[0],["agent","get","worker"])
+        self.assertEqual(herdr.call_args.kwargs["session"],"herdr-session-test")
+        external.assert_not_called()
+
+    def test_dispatch_rejects_missing_agent_status_before_prompt(self):
+        self.seed_agent()
+        task=make_task_package(m.STATE)
+        approve_test_task(task,m.STATE)
+        no_status={"result":{"agent":{"name":"worker","tab_id":"tab-test",
+                                         "pane_id":"pane-test","status":"idle"}}}
+        with patch.object(m,"herdr_json",return_value=no_status), patch.object(m,"run") as external:
+            result=m.dispatch_opaque("worker",task,request_id="req-no-agent-status")
+        self.assertFalse(result["accepted"])
+        self.assertEqual(result["status"],"UNKNOWN")
+        self.assertEqual(result["error"]["code"],"AGENT_STATUS_UNKNOWN")
+        external.assert_not_called()
+
+    def test_dispatch_rejects_changed_agent_session_value(self):
+        self.seed_agent()
+        with m.registry_transaction() as registry:
+            registry["agents"]["worker"]["herdr_agent_session_value"]="old-session-value"
+        task=make_task_package(m.STATE)
+        approve_test_task(task,m.STATE)
+        replacement={"result":{"agent":{"name":"worker","tab_id":"tab-test",
+                                           "pane_id":"pane-test","agent_status":"idle",
+                                           "agent_session":{"value":"new-session-value"}}}}
+        with patch.object(m,"herdr_json",return_value=replacement) as herdr, patch.object(m,"run") as external:
+            result=m.dispatch_opaque("worker",task,request_id="req-agent-session-replaced")
+        self.assertFalse(result["accepted"])
+        self.assertEqual(result["status"],"UNKNOWN")
+        self.assertEqual(result["error"]["code"],"AGENT_INSTANCE_STALE")
+        self.assertEqual(herdr.call_args.kwargs["session"],"herdr-session-test")
+        external.assert_not_called()
+
+    def test_delegate_verifies_identity_and_prompts_verified_pane(self):
+        self.seed_agent()
+        task=make_task_package(m.STATE)
+        approve_test_task(task,m.STATE)
+        output={}
+        def fake_run(command,**kwargs):
+            if "prompt" in command:
+                output["command"]=command
+                output["prompt"]=command[command.index("prompt")+2]
+                return subprocess.CompletedProcess(command,0,"","" )
+            marker=__import__("re").search(r"^\[RELAY TASK [^]]+\]$",output["prompt"],
+                                           flags=__import__("re").M).group(0)
+            task_id=marker[len("[RELAY TASK "):-1]
+            return subprocess.CompletedProcess(command,0,f"{marker}\n[RELAY FINISHED {task_id}]\n完成并验证","" )
+        with patch.object(m,"run",side_effect=fake_run) as external, \
+             patch.object(m,"review",return_value={"route":"PASS"}):
+            result=m.delegate("worker",task)
+        self.assertEqual(result["final_state"],"DONE")
+        prompt=next(call.args[0] for call in external.call_args_list if "prompt" in call.args[0])
+        self.assertEqual(prompt[5],"pane-test")
+
+    def test_delegate_keeps_lock_when_final_runtime_recheck_is_unknown(self):
+        self.seed_agent()
+        task=make_task_package(m.STATE)
+        approve_test_task(task,m.STATE)
+        reads={"get":0,"prompt":""}
+        def herdr(args,timeout=60,session=None):
+            if args[:2]==["agent","get"]:
+                reads["get"]+=1
+                status={1:"idle",2:"done"}.get(reads["get"],"unknown")
+                return {"result":{"agent":{"name":"worker","tab_id":"tab-test",
+                    "pane_id":"pane-test","agent_status":status}}}
+            return {"result":{}}
+        def run(command,**kwargs):
+            if "prompt" in command:
+                reads["prompt"]=command[command.index("prompt")+2]
+                return subprocess.CompletedProcess(command,0,"","")
+            marker=__import__("re").search(r"^\[RELAY TASK [^]]+\]$",reads["prompt"],
+                                           flags=__import__("re").M).group(0)
+            task_id=marker[len("[RELAY TASK "):-1]
+            return subprocess.CompletedProcess(command,0,
+                f"{marker}\n[RELAY FINISHED {task_id}]\n完成并验证","")
+        with patch.object(m,"herdr_json",side_effect=herdr),patch.object(m,"run",side_effect=run), \
+             patch.object(m,"review",return_value={"route":"PASS"}):
+            result=m.delegate("worker",task)
+        self.assertEqual(result["final_state"],"UNKNOWN")
+        self.assertEqual(m.registry()["agents"]["worker"]["lifecycle"],"BUSY")
+        self.assertTrue((m.LOCKS/"worker.lock").exists())
 
     def test_dispatch_timeout_is_unknown_and_not_replayed(self):
         self.seed_agent()
@@ -142,7 +281,8 @@ class TaskFlowTests(unittest.TestCase):
         cwd=str(Path(__file__).resolve().parent)
         responses=[{"result":{"tabs":[]}},
                    {"result":{"tab":{"tab_id":"tab-new"},"root_pane":{"pane_id":"pane-new"}}},
-                   {"result":{"agent":{"name":"worker","status":"idle"}}}]
+                   {"result":{"agent":{"name":"worker","tab_id":"tab-new","pane_id":"pane-new","agent_status":"idle"}}},
+                   {"result":{"agent":{"name":"worker","tab_id":"tab-new","pane_id":"pane-new","agent_status":"idle"}}}]
         with patch.object(m,"herdr_json",side_effect=responses):
             first=m.spawn("worker",cwd,name="worker",session="herdr-session-test",request_id="req-create-stale")
         self.assertEqual(first["lifecycle"],"IDLE")
@@ -158,7 +298,8 @@ class TaskFlowTests(unittest.TestCase):
         cwd=str(Path(__file__).resolve().parent)
         responses=[{"result":{"tabs":[]}},
                    {"result":{"tab":{"tab_id":"tab-new"},"root_pane":{"pane_id":"pane-new"}}},
-                   {"result":{"agent":{"name":"worker","status":"idle"}}}]
+                   {"result":{"agent":{"name":"worker","tab_id":"tab-new","pane_id":"pane-new","agent_status":"idle"}}},
+                   {"result":{"agent":{"name":"worker","tab_id":"tab-new","pane_id":"pane-new","agent_status":"idle"}}}]
         with patch.object(m,"herdr_json",side_effect=responses):
             first=m.spawn("worker",cwd,name="worker",session="herdr-session-test",request_id="req-create-removed")
         m.save_registry({"agents":{"worker":{**first,"lifecycle":"REMOVED"}}})
@@ -169,11 +310,12 @@ class TaskFlowTests(unittest.TestCase):
 
     def create_replayable_agent(self, request_id, external_session=None):
         cwd=str(Path(__file__).resolve().parent)
-        identity={"name":"worker","tab_id":"tab-new","pane_id":"pane-new","status":"idle"}
+        identity={"name":"worker","tab_id":"tab-new","pane_id":"pane-new","agent_status":"idle"}
         if external_session:
             identity["agent_session"]={"value":external_session}
         responses=[{"result":{"tabs":[]}},
                    {"result":{"tab":{"tab_id":"tab-new"},"root_pane":{"pane_id":"pane-new"}}},
+                   {"result":{"agent":identity}},
                    {"result":{"agent":identity}}]
         with patch.object(m,"herdr_json",side_effect=responses):
             return m.spawn("worker",cwd,name="worker",session="herdr-session-test",request_id=request_id)

@@ -18,8 +18,7 @@ class InstallCliTests(unittest.TestCase):
     def run_check(self, explicit=False):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            target = root / "target"
-            target.mkdir()
+            target = root
             fake_bin = root / "bin"
             fake_bin.mkdir()
             record = root / "systemctl-env.txt"
@@ -42,6 +41,24 @@ class InstallCliTests(unittest.TestCase):
             result = subprocess.run([str(ROOT / "install.sh"), "--check", "--root", str(target)],
                                     cwd=ROOT, env=env, text=True, capture_output=True)
             return result, record.read_text().splitlines() if record.exists() else []
+
+    def test_real_cli_rejects_non_home_root_before_systemctl(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home=Path(tmp)
+            target=home/"target"
+            target.mkdir()
+            fake_bin=home/"bin"
+            fake_bin.mkdir()
+            marker=home/"systemctl-called"
+            fake_bin.joinpath("systemctl").write_text("#!/bin/sh\ntouch \"$MARKER\"\n")
+            fake_bin.joinpath("systemctl").chmod(0o755)
+            env=os.environ.copy()
+            env.update(HOME=str(home),PATH=f"{fake_bin}:{env['PATH']}",MARKER=str(marker))
+            result=subprocess.run([str(ROOT/"install.sh"),"--check","--root",str(target)],
+                                  cwd=ROOT,env=env,text=True,capture_output=True)
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn("--root 必须等于当前用户 HOME",result.stderr)
+        self.assertFalse(marker.exists())
 
     def test_check_derives_missing_user_bus_environment(self):
         result, values = self.run_check()

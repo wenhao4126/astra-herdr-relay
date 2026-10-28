@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from test_relay import approved_test_task, m, seed_agent
+from test_relay import approved_test_task, fake_herdr_json, m, seed_agent
 
 
 class EventRegressionTests(unittest.TestCase):
@@ -30,7 +30,7 @@ class EventRegressionTests(unittest.TestCase):
             result = m.send_opaque("test-worker", json.dumps(task))
         self.assertTrue(result["accepted"])
         command=run.call_args.args[0]
-        self.assertEqual(command[:6], ["herdr","--session","relay-test-session","agent","prompt","test-worker"])
+        self.assertEqual(command[:6], ["herdr","--session","relay-test-session","agent","prompt","pane-test-worker"])
         self.assertIn('"schema_version":1',command[6])
 
     def test_explicit_status_control_never_sends_free_text(self):
@@ -51,23 +51,30 @@ class EventRegressionTests(unittest.TestCase):
         }.items():
             self.enterContext(patch.object(m, key, value))
         self.enterContext(patch.object(m,"HERDR_SESSION","relay-test-session"))
+        self.enterContext(patch.object(m,"herdr_json",side_effect=fake_herdr_json))
 
     def test_spawn_records_named_agent_and_reaches_idle(self):
         # 隔离外部进程，验证创建流程确实能越过日志记录并启动代理。
         with patch.object(m, "herdr_json", side_effect=[
             {"result": {"tabs": [{"tab_id": "astra-tab", "focused": True}]}},
             {"result": {"tab": {"tab_id": "test-tab"},
-                        "root_pane": {"pane_id": "test-pane"}}}, {},
+                        "root_pane": {"pane_id": "test-pane"}}},
+            {"result":{"agent":{"name":"test-worker","tab_id":"test-tab",
+                                  "pane_id":"test-pane","agent_status":"idle"}}},
+            {"result":{"agent":{"name":"test-worker","tab_id":"test-tab",
+                                  "pane_id":"test-pane","agent_status":"idle"}}},
             {"result": {"tabs": [{"tab_id": "astra-tab", "focused": True}]}},
         ]) as herdr:
             rec = m.spawn("worker", "/tmp", name="test-worker")
         self.assertEqual(rec["lifecycle"], "IDLE")
-        self.assertEqual(herdr.call_count, 4)
+        self.assertEqual(herdr.call_count, 5)
         self.assertIn("--no-focus", herdr.call_args_list[1].args[0])
         self.assertNotIn("--focus", herdr.call_args_list[1].args[0])
         self.assertEqual(herdr.call_args_list[2].args[0],
                          ["agent", "start", "test-worker", "--kind", "codex",
                           "--pane", "test-pane", "--timeout", "30000"])
+        self.assertEqual(herdr.call_args_list[3].args[0], ["agent","get","test-worker"])
+        self.assertEqual(herdr.call_args_list[3].kwargs["session"], "relay-test-session")
         events = [json.loads(line) for line in m.EVENTS.read_text().splitlines()]
         self.assertEqual(events[0]["event"], "agent_creating")
         self.assertEqual(events[0]["name"], "test-worker")
@@ -79,20 +86,62 @@ class EventRegressionTests(unittest.TestCase):
             {"result": {"tab": {"tab_id": "test-tab"},
                         "root_pane": {"pane_id": "test-pane"}}},
             RuntimeError("agent_not_ready"),
-            {"result": {"tabs": [{"tab_id": "test-tab", "focused": True}]}}, {},
+            {"result": {"tabs": [{"tab_id": "test-tab", "focused": True}]}},
+            {},
         ]) as herdr:
             rec = m.spawn("reviewer", "/tmp", name="claude-reviewer", kind="claude", model="haiku-4.5")
         self.assertEqual(rec["lifecycle"], "BLOCKED")
+        self.assertEqual(rec["status"], "NOT_READY")
         self.assertEqual(rec["tab_id"], "test-tab")
         self.assertEqual(herdr.call_count, 5)
         self.assertIn("--no-focus", herdr.call_args_list[1].args[0])
         self.assertEqual(herdr.call_args_list[2].args[0][-3:], ["--", "--model", "haiku-4.5"])
 
+    def test_spawn_never_marks_unconfirmed_start_response_idle(self):
+        cases=(
+            ({"name":"worker","tab_id":"tab","pane_id":"pane","agent_status":"starting"},"NOT_READY","BLOCKED"),
+            ({"name":"worker","tab_id":"tab","pane_id":"pane","agent_status":"blocked"},"NOT_READY","BLOCKED"),
+            ({"name":"worker","tab_id":"tab","pane_id":"pane","agent_status":"unknown"},"UNKNOWN","UNKNOWN"),
+            ({"name":"worker","tab_id":"tab","pane_id":"pane"},"UNKNOWN","UNKNOWN"),
+            ({"name":"worker","tab_id":"replacement","pane_id":"pane","agent_status":"idle"},"UNKNOWN","UNKNOWN"),
+        )
+        for response,status,lifecycle in cases:
+            with self.subTest(status=status,response=response):
+                m.save_registry({"agents":{}})
+                with patch.object(m,"herdr_json",side_effect=[
+                    {"result":{"tabs":[]}},
+                    {"result":{"tab":{"tab_id":"tab"},"root_pane":{"pane_id":"pane"}}},
+                    {"result":{"agent":response}},
+                ]) as herdr:
+                    record=m.spawn("worker","/tmp",name="worker")
+                self.assertEqual(record["status"],status)
+                self.assertEqual(record["lifecycle"],lifecycle)
+                self.assertFalse(any(call.args[0][:2]==["agent","get"]
+                                     for call in herdr.call_args_list))
+
+    def test_spawn_get_replacement_after_ready_start_returns_unknown(self):
+        with patch.object(m,"herdr_json",side_effect=[
+            {"result":{"tabs":[]}},
+            {"result":{"tab":{"tab_id":"tab"},"root_pane":{"pane_id":"pane"}}},
+            {"result":{"agent":{"name":"worker","tab_id":"tab","pane_id":"pane",
+                                  "agent_status":"idle"}}},
+            {"result":{"agent":{"name":"worker","tab_id":"replacement","pane_id":"pane",
+                                  "agent_status":"idle"}}},
+        ]) as herdr:
+            record=m.spawn("worker","/tmp",name="worker")
+        self.assertEqual(record["lifecycle"],"UNKNOWN")
+        self.assertEqual(record["status"],"UNKNOWN")
+        self.assertEqual(herdr.call_args_list[3].args[0],["agent","get","worker"])
+
     def test_codex_start_forwards_explicit_model(self):
         with patch.object(m, "herdr_json", side_effect=[
             {"result": {"tabs": []}},
             {"result": {"tab": {"tab_id": "test-tab"},
-                        "root_pane": {"pane_id": "test-pane"}}}, {},
+                        "root_pane": {"pane_id": "test-pane"}}},
+            {"result":{"agent":{"name":"test-worker","tab_id":"test-tab",
+                                  "pane_id":"test-pane","agent_status":"idle"}}},
+            {"result":{"agent":{"name":"test-worker","tab_id":"test-tab",
+                                  "pane_id":"test-pane","agent_status":"idle"}}},
         ]) as herdr:
             m.spawn("worker", "/tmp", name="test-worker", model="gpt-6-luna")
         self.assertEqual(herdr.call_args_list[2].args[0][-3:], ["--", "--model", "gpt-6-luna"])
@@ -100,7 +149,11 @@ class EventRegressionTests(unittest.TestCase):
     def test_focus_restores_only_when_created_tab_still_focused(self):
         with patch.object(m, "herdr_json", side_effect=[
             {"result": {"tabs": [{"tab_id": "astra", "focused": True}]}},
-            {"result": {"tab": {"tab_id": "new"}, "root_pane": {"pane_id": "p"}}}, {},
+            {"result": {"tab": {"tab_id": "new"}, "root_pane": {"pane_id": "p"}}},
+            {"result":{"agent":{"name":"test-worker","tab_id":"new",
+                                  "pane_id":"p","agent_status":"idle"}}},
+            {"result":{"agent":{"name":"test-worker","tab_id":"new",
+                                  "pane_id":"p","agent_status":"idle"}}},
             {"result": {"tabs": [{"tab_id": "new", "focused": True}]}}, {},
         ]) as herdr:
             m.spawn("worker", "/tmp", name="test-worker")
@@ -109,11 +162,15 @@ class EventRegressionTests(unittest.TestCase):
     def test_focus_does_not_override_user_tab_change(self):
         with patch.object(m, "herdr_json", side_effect=[
             {"result": {"tabs": [{"tab_id": "astra", "focused": True}]}},
-            {"result": {"tab": {"tab_id": "new"}, "root_pane": {"pane_id": "p"}}}, {},
+            {"result": {"tab": {"tab_id": "new"}, "root_pane": {"pane_id": "p"}}},
+            {"result":{"agent":{"name":"test-worker","tab_id":"new",
+                                  "pane_id":"p","agent_status":"idle"}}},
+            {"result":{"agent":{"name":"test-worker","tab_id":"new",
+                                  "pane_id":"p","agent_status":"idle"}}},
             {"result": {"tabs": [{"tab_id": "user-choice", "focused": True}]}},
         ]) as herdr:
             m.spawn("worker", "/tmp", name="test-worker")
-        self.assertEqual(herdr.call_count, 4)
+        self.assertEqual(herdr.call_count, 5)
 
     def test_start_review_pair_stops_on_duplicate_without_cleanup(self):
         with patch.object(m, "spawn", side_effect=[{"name": "codex-worker-luna", "lifecycle":"IDLE"}, SystemExit("agent already active")]) as spawn, \
@@ -127,13 +184,17 @@ class EventRegressionTests(unittest.TestCase):
 
     def test_start_review_pair_reuses_fixed_agents_without_spawning_or_changing_focus(self):
         m.save_registry({"agents": {
-            "codex-worker-luna": {"name":"codex-worker-luna","role":"worker","lifecycle":"IDLE","kind":"codex","cwd":"/tmp","model":"gpt-6-luna"},
-            "opencode-reviewer": {"name":"opencode-reviewer","role":"reviewer","lifecycle":"IDLE","kind":"opencode","cwd":"/tmp","model":None},
+            "codex-worker-luna": {"name":"codex-worker-luna","role":"worker","lifecycle":"IDLE","kind":"codex","cwd":"/tmp","model":"gpt-6-luna","herdr_session":"relay-test-session","tab_id":"tab-worker","pane_id":"pane-worker","created_at":1},
+            "opencode-reviewer": {"name":"opencode-reviewer","role":"reviewer","lifecycle":"IDLE","kind":"opencode","cwd":"/tmp","model":None,"herdr_session":"relay-test-session","tab_id":"tab-reviewer","pane_id":"pane-reviewer","created_at":2},
         }})
-        with patch.object(m, "spawn") as spawn, patch.object(m, "herdr_json") as herdr:
+        with patch.object(m, "spawn") as spawn, patch.object(m, "herdr_json",side_effect=fake_herdr_json) as herdr:
             result=m.start_review_pair("/tmp")
         spawn.assert_not_called()
-        herdr.assert_not_called()
+        self.assertEqual([call.args[0] for call in herdr.call_args_list],
+                         [["agent","get","codex-worker-luna"],
+                          ["agent","get","opencode-reviewer"]])
+        self.assertTrue(all(call.kwargs.get("session")=="relay-test-session"
+                            for call in herdr.call_args_list))
         self.assertTrue(result["complete"])
         self.assertEqual(len(result["reused"]), 2)
         self.assertEqual(next(x for x in result["reused"] if x["name"]=="opencode-reviewer")["model_status"], "unverified")
@@ -150,10 +211,11 @@ class EventRegressionTests(unittest.TestCase):
 
     def test_start_review_pair_rejects_reused_wrong_kind_without_mutating_agent(self):
         m.save_registry({"agents": {
-            "codex-worker-luna": {"name":"codex-worker-luna","role":"worker","lifecycle":"IDLE","kind":"codex","cwd":"/tmp","model":"gpt-6-luna"},
+            "codex-worker-luna": {"name":"codex-worker-luna","role":"worker","lifecycle":"IDLE","kind":"codex","cwd":"/tmp","model":"gpt-6-luna","herdr_session":"relay-test-session","tab_id":"tab-worker","pane_id":"pane-worker","created_at":1},
             "opencode-reviewer": {"name":"opencode-reviewer","role":"reviewer","lifecycle":"IDLE","kind":"claude","cwd":"/tmp","model":None},
         }})
-        with patch.object(m, "spawn") as spawn, patch.object(m, "release") as release:
+        with patch.object(m, "spawn") as spawn, patch.object(m, "release") as release, \
+             patch.object(m,"herdr_json",side_effect=fake_herdr_json):
             result=m.start_review_pair("/tmp")
         spawn.assert_not_called()
         release.assert_not_called()

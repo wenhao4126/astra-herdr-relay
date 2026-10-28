@@ -3,6 +3,7 @@ LIB=pathlib.Path(__file__).parents[1]/"lib"
 sys.path.insert(0,str(LIB))
 P=pathlib.Path(__file__).parents[1]/"lib"/"relay.py"
 spec=importlib.util.spec_from_file_location("relay",P); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+real_herdr_json=m.herdr_json
 
 
 def make_task_package(directory=None, task_id="relay-test"):
@@ -62,6 +63,30 @@ def seed_agent(name="worker",**changes):
     agents[name]=record
     m.save_registry({"agents":agents})
     return record
+
+
+def fake_herdr_json(args,timeout=60,session=None):
+    """隔离真实 Herdr CLI，并按临时 registry 返回可核对身份。"""
+    if args[:2]==["agent","get"]:
+        name=args[2]
+        record=m.registry()["agents"].get(name)
+        if not record:
+            return {"error":{"code":"agent_not_found"}}
+        agent={key:record.get(key) for key in ("name","tab_id","pane_id")}
+        agent["agent_status"]=record.get("test_runtime","idle")
+        if record.get("herdr_agent_session_value"):
+            agent["agent_session"]={"value":record["herdr_agent_session_value"]}
+        return {"result":{"agent":agent}}
+    if args[:2]==["agent","list"]:
+        agents=[]
+        for record in m.registry()["agents"].values():
+            agent={key:record.get(key) for key in ("name","tab_id","pane_id")}
+            agent["agent_status"]=record.get("test_runtime","idle")
+            agents.append(agent)
+        return {"result":{"agents":agents}}
+    if args[:2]==["tab","list"]:
+        return {"result":{"tabs":[]}}
+    return {"result":{}}
 
 class RelayContractTests(unittest.TestCase):
     def test_prob_rejects_bool(self):
