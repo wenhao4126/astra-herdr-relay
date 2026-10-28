@@ -225,12 +225,32 @@ class InstallTests(unittest.TestCase):
         self.assertTrue(path.is_file())
         self.assertEqual(json.loads(path.read_text()),{})
 
+    def test_first_install_rollback_does_not_restore_dangling_relay_hooks(self):
+        fragment=json.loads((self.source/"hooks/hooks.fragment.json").read_text())
+        path=self.home/".codex/hooks.json"
+        path.parent.mkdir(parents=True,exist_ok=True)
+        path.write_text(json.dumps({"hooks":fragment["hooks"]}),encoding="utf-8")
+
+        installed=self.install()
+        self.installer.rollback(self.home,installed["backup_id"],runner=self.systemd,
+                                proc_root=self.proc)
+
+        self.assertTrue(path.is_file())
+        self.assertEqual(json.loads(path.read_text()),{})
+        self.assertFalse((self.home/".local/lib/astra-herdr-relay/hooks/astra_relay_subagent_redirect.py").exists())
+
     def test_rollback_upgrade_restores_previous_program_and_keeps_new_user_data(self):
         first = self.install()
         relay = self.home / ".local/lib/astra-herdr-relay/relay.py"
         previous = relay.read_bytes()
+        hook_path = self.home / ".codex/hooks.json"
+        previous_hook = json.loads(hook_path.read_text())["hooks"]["PreToolUse"][0]
         new_source = self.source / "lib/relay.py"
         new_source.write_bytes(new_source.read_bytes() + b"\n# upgrade payload\n")
+        fragment_path = self.source / "hooks/hooks.fragment.json"
+        fragment = json.loads(fragment_path.read_text())
+        fragment["hooks"]["PreToolUse"][0]["hooks"][0]["statusMessage"] = "Updated Relay routing"
+        fragment_path.write_text(json.dumps(fragment), encoding="utf-8")
         self.refresh_manifest()
         second = self.install()
         self.assertNotEqual(relay.read_bytes(), previous)
@@ -238,7 +258,7 @@ class InstallTests(unittest.TestCase):
         config.write_text("NEW_SECRET=keep\n")
         task = self.home / ".local/state/astra-herdr-relay/tasks/forward.json"
         task.write_text('{"task_id":"forward"}\n')
-        hook = self.home / ".codex/hooks.json"
+        hook = hook_path
         data = json.loads(hook.read_text())
         user_rule = {"matcher": "UserTool", "hooks": [{"type": "command", "command": "echo user"}]}
         data["hooks"].setdefault("PreToolUse", []).append(user_rule)
@@ -254,9 +274,32 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(relay.read_bytes(), previous)
         self.assertEqual(config.read_text(), "NEW_SECRET=keep\n")
         self.assertEqual(task.read_text(), '{"task_id":"forward"}\n')
-        self.assertIn(user_rule, json.loads(hook.read_text())["hooks"]["PreToolUse"])
+        after_hooks = json.loads(hook.read_text())["hooks"]["PreToolUse"]
+        self.assertIn(user_rule, after_hooks)
+        self.assertIn(previous_hook, after_hooks)
+        self.assertNotIn(fragment["hooks"]["PreToolUse"][0], after_hooks)
         self.assertIn("upgrade 后用户内容", agents.read_text())
         self.assertTrue(self.systemd.active and self.systemd.enabled)
+
+    def test_legacy_program_rollback_restores_its_relay_hook(self):
+        unit = self.home / ".config/systemd/user/astra-herdr-relay.service"
+        unit.parent.mkdir(parents=True)
+        unit.write_text("legacy relay unit\n")
+        relay = self.home / ".local/lib/astra-herdr-relay/relay.py"
+        relay.parent.mkdir(parents=True)
+        relay.write_text("legacy relay program\n")
+        fragment=json.loads((self.source/"hooks/hooks.fragment.json").read_text())
+        hook_path=self.home/".codex/hooks.json"
+        hook_path.parent.mkdir(parents=True,exist_ok=True)
+        hook_path.write_text(json.dumps({"hooks":fragment["hooks"]}),encoding="utf-8")
+        self.systemd.installed = True
+
+        installed = self.install()
+        self.installer.rollback(self.home, installed["backup_id"], runner=self.systemd,
+                                proc_root=self.proc)
+
+        self.assertEqual(relay.read_text(), "legacy relay program\n")
+        self.assertEqual(json.loads(hook_path.read_text()), {"hooks":fragment["hooks"]})
 
     def test_rollback_first_install_restores_uninstalled_program_state_only(self):
         installed = self.install()

@@ -800,6 +800,17 @@ def rollback(root, backup_id, *, runner=subprocess.run, proc_root=Path("/proc"),
                     record = current["originals"].get(rel)
                     if not isinstance(record, dict) or not record.get("existed") or record.get("sha256") != digest:
                         raise InstallError("版本链快照与父安装哈希不匹配，拒绝回滚")
+                rollback_hooks_before = parent.get("owned_hooks_after", {})
+            elif (current.get("legacy_install") and
+                  current.get("originals", {}).get(".local/lib/astra-herdr-relay/relay.py", {}).get("existed") is True):
+                rollback_hooks_before = current.get("rollback_hooks_before",
+                                                     current.get("owned_hooks_before", {}))
+            else:
+                rollback_hooks_before = {}
+            if (not isinstance(rollback_hooks_before, dict) or
+                    any(not isinstance(event, str) or not isinstance(rules, list)
+                        for event, rules in rollback_hooks_before.items())):
+                raise InstallError("安装账本可恢复 Hook 记录无效")
             snapshot = _read_transaction_files(root)
             _, _, _, pointer = _metadata_paths(root)
             pointer_before = pointer.read_bytes()
@@ -811,7 +822,7 @@ def rollback(root, backup_id, *, runner=subprocess.run, proc_root=Path("/proc"),
                     else:
                         _atomic_write(path, data, mode if mode is not None else 0o600)
                 _mutate_owned_hooks(root / ".codex/hooks.json", current.get("owned_hooks_after", {}),
-                                   current.get("owned_hooks_before", {}),
+                                   rollback_hooks_before,
                                    preserve_empty=current.get("hook_file_before_exists", True))
                 _replace_agents_block(root / ".codex/AGENTS.md", current.get("owned_agents_after"),
                                       current.get("owned_agents_before"),
@@ -938,6 +949,11 @@ def _install(source, root, *, runner=subprocess.run, proc_root=Path("/proc"), ch
         _, owned_agents_before = _read_owned_agents(agents)
     if not isinstance(owned_hooks_before, dict) or any(not isinstance(v, list) for v in owned_hooks_before.values()):
         raise InstallError("账本中的 Hook 所有权记录无效")
+    if (current_ledger or
+            (legacy_install and originals.get(library / "relay.py") is not None)):
+        rollback_hooks_before = owned_hooks_before
+    else:
+        rollback_hooks_before = {}
     agents_text = (source / "AGENTS.relay.block.md").read_text(encoding="utf-8").strip()
     _, owned_agents_after = _read_owned_agents_text(agents_text)
 
@@ -1008,6 +1024,7 @@ def _install(source, root, *, runner=subprocess.run, proc_root=Path("/proc"), ch
             } for path, data in originals.items() if path in targets},
             "service_before": {k: service[k] for k in ("installed", "active", "enabled", "unit_state")},
             "owned_hooks_before": owned_hooks_before, "owned_hooks_after": owned_hooks_after,
+            "rollback_hooks_before": rollback_hooks_before,
             "owned_agents_before": owned_agents_before, "owned_agents_after": owned_agents_after,
             "hook_file_before_exists": originals[hook_config] is not None,
             "agents_file_before_exists": originals[agents] is not None,
