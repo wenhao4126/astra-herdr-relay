@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "^(spawn_agent|Agent|send_message|followup_task|close_agent|wait_agent|interrupt_agent|resume_agent|list_agents)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ~/.local/lib/astra-herdr-relay/hooks/astra_relay_subagent_redirect.py",
+            "timeout": 180,
+            "statusMessage": "Routing Astra child-agent action through Relay → Herdr"
+          }
+        ]
+      }
+    ]
+  }
+}

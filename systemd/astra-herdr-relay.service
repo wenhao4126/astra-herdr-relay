@@ -1,0 +1,14 @@
+[Unit]
+Description=Astra Herdr Relay v0.5.0
+After=default.target
+
+[Service]
+Type=simple
+EnvironmentFile=-%h/.config/astra-herdr-relay/relay.env
+EnvironmentFile=-%h/.config/astra-herdr-relay/secret.env
+ExecStart=%h/.local/bin/astra-relayd
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
