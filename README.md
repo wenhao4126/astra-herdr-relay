@@ -86,15 +86,30 @@ OCR 官方 JSON 的 `complete` 与旧版 `success` 是完整状态；`partial`�
 cd astra-herdr-relay-v0.5.0-fixed-20260923
 ./install.sh --check
 ./install.sh
+./rollback.sh list-backups
+./rollback.sh --backup-id <backup-id> --check
+./rollback.sh --backup-id <backup-id>
+./uninstall.sh --check
+./uninstall.sh
 ```
 
 上面的命令使用当前源码目录；不要从同层旧 `.tar.zst` 解压后安装本次优化。安装会修改用户目录中的程序和服务，执行前先确认 Relay 没有活动任务。当前源码的修改没有自动安装到本机。
 
-`--check` 只运行预检，不修改系统。正常安装在预检通过后才执行更新。存在活动 Relay Agent、任务锁或正在执行的 Relay CLI 时，安装器应拒绝覆盖。增量升级仅替换发行包管理的程序文件，保留 `~/.config/astra-herdr-relay` 和 `~/.local/state/astra-herdr-relay` 的全部已有内容。部署失败时恢复程序文件及 service 原状态，不回滚运行状态目录。
+`--check` 只运行预检，不修改目标目录。`uninstall.sh` 与 `rollback.sh` 也支持 `--root <目录>` 和 `--check`；默认 root 是当前用户的 HOME。`rollback.sh` 必须给出 `--backup-id`，有效 ID 先由 `rollback.sh list-backups` 列出。只有当前安装账本对应的回滚点适用于当前版本链；工具不会猜测备份或接受任意路径。
+
+每次成功安装都会在 `~/.local/state/astra-herdr-relay/install-ledgers/` 保存私有安装账本，并在 `install-backups/<backup-id>/` 保存受管程序原快照。卸载只在程序 SHA-256 仍与账本一致时删除本 Relay 安装的程序与 unit；用户修改过的受管文件会让操作在停服务前拒绝。卸载移除账本记录的 Relay Hook 规则和 AGENTS 标记块，保留其他 Hook、用户文档、配置、密钥、运行状态、任务锁、事件、registry 和备份。当前版本不提供 purge。
+
+没有新账本的旧安装需先由本发行包成功升级一次，之后再执行卸载或回滚；账本不能确认所有权时会拒绝操作。升级检测到旧 Relay user unit 时会将其标为兼容升级，卸载会移除 Relay 程序，回滚仍可恢复升级前快照。
+
+回滚只恢复所选安装的受管程序快照与安装前服务状态，并只替换 Relay 自有 Hook/AGENTS 片段。配置和密钥保留当前值；registry、任务、锁、事件及其他推进中的状态绝不从旧备份覆盖。三类变更都会检查活动任务和 Relay 进程，在维护门禁后排空；未知状态或活动任务会拒绝操作。失败时恢复本次操作前的受管文件与服务状态，并在私有 state 中记录错误。卸载不关闭 Herdr 标签或用户代理。
+
+程序、账本和备份均要求普通文件及 root 内受控路径；符号链接、越界路径、哈希不符和不适用版本链都会拒绝。systemd 命令只作用于 `astra-herdr-relay.service` 的 user unit，不执行全局 reset。部署失败时安装器继续使用原有程序/service 失败恢复逻辑，不回滚运行状态目录。
+
+发行包源码变更后，用 `python3 scripts/update_manifest.py` 按路径排序并实际重算 `MANIFEST.sha256`；安装前会校验清单内所有普通文件。
 
 安装预检允许保留已结算的 BUSY 记录：只有任务编号、任务 JSON、代理归属、`HUMAN_REVIEW`/`BLOCKED` 结算状态和对应锁全部严格匹配时才放行，并保留 registry、task 和 lock 原样；运行中、正在转换、缺失或归属不匹配的记录仍会阻止安装。`install.sh` 在 `XDG_RUNTIME_DIR` 或 `DBUS_SESSION_BUS_ADDRESS` 缺失时，仅当 `/run/user/$(id -u)/bus` 是 socket 才推导 user bus 环境；显式设置的值始终优先。
 
-本次交付仅生成和验证发行包；当前机器的真实安装与 Herdr → Codex → Jev E2E 属于后续部署阶段。Jev 合法返回 `DEEP_REVIEW` 时不会为了得到 `DONE` 而降低门槛。
+本次代码验证使用临时 root、fake systemctl 与 fake proc；不会调用真实安装。真实安装以及 Herdr → Codex → Jev E2E 仍属于单独部署阶段。Jev 合法返回 `DEEP_REVIEW` 时不会为了得到 `DONE` 而降低门槛。
 
 ## Commands
 

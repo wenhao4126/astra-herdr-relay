@@ -26,6 +26,7 @@ class FakeSystemd:
         self.fragment_path = str(home / ".config/systemd/user/astra-herdr-relay.service")
         self.wrong_exec_path = False
         self.exec_path_override = None
+        self.fail_next_daemon_reload = False
         self.on_stop = None
         self.calls = []
 
@@ -64,7 +65,11 @@ class FakeSystemd:
             if self.on_stop:
                 self.on_stop()
         elif command[:3] == ["systemctl", "--user", "daemon-reload"]:
-            self.installed = Path(self.fragment_path).is_file()
+            if self.fail_next_daemon_reload:
+                self.fail_next_daemon_reload = False
+                result.returncode, result.stderr = 1, "reload failed"
+            else:
+                self.installed = Path(self.fragment_path).is_file()
         elif command[:3] == ["systemctl", "--user", "start"]:
             self.installed = True
             if self.fail_next_start or self.fail_all_starts:
@@ -82,6 +87,10 @@ class FakeSystemd:
                 self._set_process()
         elif command[:4] == ["systemctl", "--user", "disable", "--now"]:
             self.active = self.enabled = False
+        elif command[:3] == ["systemctl", "--user", "disable"]:
+            self.enabled = False
+        elif command[:3] == ["systemctl", "--user", "enable"]:
+            self.enabled = True
         return result
 
     def _set_process(self):
@@ -115,10 +124,282 @@ class InstallTests(unittest.TestCase):
         return self.installer.install(self.source, self.home, proc_root=self.proc,
                                       runner=self.systemd, **kwargs)
 
+    def refresh_manifest(self):
+        manifest = "".join(f"{hashlib.sha256((self.source / rel).read_bytes()).hexdigest()}  {rel}\n"
+                           for rel in self.installer.REQUIRED_FILES)
+        (self.source / "MANIFEST.sha256").write_text(manifest, encoding="utf-8")
+
+    def test_install_ledger_is_private_and_list_backups_is_read_only(self):
+        result = self.install()
+        state = self.home / ".local/state/astra-herdr-relay"
+        ledger = state / "install-ledgers" / f"{result['backup_id']}.json"
+        backup = state / "install-backups" / result["backup_id"]
+        self.assertEqual(state.joinpath("install-ledgers").stat().st_mode & 0o777, 0o700)
+        self.assertEqual(ledger.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(backup.stat().st_mode & 0o777, 0o700)
+        before = sorted(str(p.relative_to(self.home)) for p in self.home.rglob("*"))
+        listing = self.installer.list_backups(self.home)
+        after = sorted(str(p.relative_to(self.home)) for p in self.home.rglob("*"))
+        self.assertEqual(before, after)
+        self.assertEqual(listing["backups"][0]["backup_id"], result["backup_id"])
+
+    def test_uninstall_and_rollback_check_are_read_only(self):
+        installed = self.install()
+        calls_before = len(self.systemd.calls)
+        before = sorted((str(p.relative_to(self.home)), p.is_dir(),
+                         p.read_bytes() if p.is_file() else None) for p in self.home.rglob("*"))
+        self.assertEqual(self.installer.uninstall(self.home, runner=self.systemd, proc_root=self.proc,
+                                                  check=True)["mode"], "check")
+        self.assertEqual(self.installer.rollback(self.home, installed["backup_id"], runner=self.systemd,
+                                                 proc_root=self.proc, check=True)["mode"], "check")
+        after = sorted((str(p.relative_to(self.home)), p.is_dir(),
+                        p.read_bytes() if p.is_file() else None) for p in self.home.rglob("*"))
+        self.assertEqual(before, after)
+        self.assertFalse(any(command[2:3] in (["stop"], ["start"], ["disable"], ["enable"])
+                             for command in self.systemd.calls[calls_before:]))
+
+    def test_uninstall_preserves_user_hook_agents_config_state_and_backups(self):
+        installed = self.install()
+        hook = self.home / ".codex/hooks.json"
+        data = json.loads(hook.read_text())
+        user_rule = {"matcher": "UserTool", "hooks": [{"type": "command", "command": "echo user"}]}
+        data["hooks"].setdefault("PreToolUse", []).append(user_rule)
+        relay_rule = data["hooks"]["PreToolUse"][0]
+        data["hooks"]["PreToolUse"].append(relay_rule)
+        data["hooks"]["Notification"] = [{"matcher": "*", "hooks": [{"type": "command", "command": "notify"}]}]
+        hook.write_text(json.dumps(data))
+        agents = self.home / ".codex/AGENTS.md"
+        with agents.open("a") as stream:
+            stream.write("\n用户新增说明\n")
+        config = self.home / ".config/astra-herdr-relay/secret.env"
+        config.write_text("USER_SECRET=keep\n")
+        task = self.home / ".local/state/astra-herdr-relay/tasks/keep.json"
+        task.parent.mkdir(parents=True, exist_ok=True)
+        task.write_text('{"task_id":"keep"}\n')
+        retained = (config.read_bytes(), task.read_bytes())
+
+        result = self.installer.uninstall(self.home, runner=self.systemd, proc_root=self.proc)
+
+        self.assertEqual(result["mode"], "uninstalled")
+        self.assertEqual((config.read_bytes(), task.read_bytes()), retained)
+        after_hooks = json.loads(hook.read_text())["hooks"]
+        self.assertIn(user_rule, after_hooks["PreToolUse"])
+        self.assertEqual(after_hooks["PreToolUse"].count(relay_rule), 1)
+        self.assertIn("Notification", after_hooks)
+        self.assertIn("用户新增说明", agents.read_text())
+        self.assertNotIn("ASTRA-HERDR-RELAY-V050-BEGIN", agents.read_text())
+        self.assertFalse((self.home / ".local/lib/astra-herdr-relay/relay.py").exists())
+        self.assertFalse((self.home / ".config/systemd/user/astra-herdr-relay.service").exists())
+        self.assertFalse(self.systemd.active or self.systemd.enabled)
+        self.assertTrue((self.home / ".local/state/astra-herdr-relay/install-backups" / installed["backup_id"]).is_dir())
+
+    def test_rollback_upgrade_restores_previous_program_and_keeps_new_user_data(self):
+        first = self.install()
+        relay = self.home / ".local/lib/astra-herdr-relay/relay.py"
+        previous = relay.read_bytes()
+        new_source = self.source / "lib/relay.py"
+        new_source.write_bytes(new_source.read_bytes() + b"\n# upgrade payload\n")
+        self.refresh_manifest()
+        second = self.install()
+        self.assertNotEqual(relay.read_bytes(), previous)
+        config = self.home / ".config/astra-herdr-relay/secret.env"
+        config.write_text("NEW_SECRET=keep\n")
+        task = self.home / ".local/state/astra-herdr-relay/tasks/forward.json"
+        task.write_text('{"task_id":"forward"}\n')
+        hook = self.home / ".codex/hooks.json"
+        data = json.loads(hook.read_text())
+        user_rule = {"matcher": "UserTool", "hooks": [{"type": "command", "command": "echo user"}]}
+        data["hooks"].setdefault("PreToolUse", []).append(user_rule)
+        hook.write_text(json.dumps(data))
+        agents = self.home / ".codex/AGENTS.md"
+        with agents.open("a") as stream:
+            stream.write("\nupgrade 后用户内容\n")
+
+        result = self.installer.rollback(self.home, second["backup_id"], runner=self.systemd,
+                                         proc_root=self.proc)
+
+        self.assertEqual(result["restored_install_id"], first["backup_id"])
+        self.assertEqual(relay.read_bytes(), previous)
+        self.assertEqual(config.read_text(), "NEW_SECRET=keep\n")
+        self.assertEqual(task.read_text(), '{"task_id":"forward"}\n')
+        self.assertIn(user_rule, json.loads(hook.read_text())["hooks"]["PreToolUse"])
+        self.assertIn("upgrade 后用户内容", agents.read_text())
+        self.assertTrue(self.systemd.active and self.systemd.enabled)
+
+    def test_rollback_first_install_restores_uninstalled_program_state_only(self):
+        installed = self.install()
+        config = self.home / ".config/astra-herdr-relay/secret.env"
+        config.write_text("CURRENT_SECRET=keep\n")
+        task = self.home / ".local/state/astra-herdr-relay/tasks/keep.json"
+        task.write_text('{"task_id":"keep"}\n')
+
+        result = self.installer.rollback(self.home, installed["backup_id"], runner=self.systemd,
+                                         proc_root=self.proc)
+
+        self.assertIsNone(result["restored_install_id"])
+        self.assertTrue(all(not path.exists() for path in self.installer._installed_targets(self.home)))
+        self.assertFalse((self.home / ".codex/hooks.json").exists())
+        self.assertFalse((self.home / ".codex/AGENTS.md").exists())
+        self.assertEqual(config.read_text(), "CURRENT_SECRET=keep\n")
+        self.assertEqual(task.read_text(), '{"task_id":"keep"}\n')
+        self.assertFalse(self.systemd.active or self.systemd.enabled)
+
+    def test_uninstall_restores_preexisting_unowned_target_and_mode(self):
+        old = self.home / ".local/bin/astra-relay"
+        old.parent.mkdir(parents=True)
+        old.write_bytes(b"preexisting wrapper\n")
+        old.chmod(0o711)
+        installed = self.install()
+        self.assertNotEqual(old.read_bytes(), b"preexisting wrapper\n")
+
+        self.installer.uninstall(self.home, runner=self.systemd, proc_root=self.proc)
+
+        self.assertEqual(old.read_bytes(), b"preexisting wrapper\n")
+        self.assertEqual(old.stat().st_mode & 0o777, 0o711)
+
+    def test_legacy_install_upgrade_creates_owned_ledger_for_uninstall(self):
+        unit = self.home / ".config/systemd/user/astra-herdr-relay.service"
+        unit.parent.mkdir(parents=True)
+        unit.write_text("legacy relay unit\n")
+        self.systemd.installed = True
+        installed = self.install()
+        ledger = self.installer._load_ledger(self.home, installed["backup_id"])
+        self.assertTrue(ledger["legacy_install"])
+
+        self.installer.uninstall(self.home, runner=self.systemd, proc_root=self.proc)
+
+        self.assertFalse(unit.exists())
+        self.assertFalse(self.systemd.active or self.systemd.enabled)
+
+    def test_uninstall_busy_agent_refuses_without_stopping_service(self):
+        self.install()
+        state = self.home / ".local/state/astra-herdr-relay"
+        (state / "agents.json").write_text(json.dumps({"agents": {"worker": {"lifecycle": "BUSY"}}}))
+        before = (self.home / ".local/lib/astra-herdr-relay/relay.py").read_bytes()
+        with self.assertRaisesRegex(self.installer.InstallError, "活动代理"):
+            self.installer.uninstall(self.home, runner=self.systemd, proc_root=self.proc)
+        self.assertEqual((self.home / ".local/lib/astra-herdr-relay/relay.py").read_bytes(), before)
+        self.assertFalse(any(command[:3] == ["systemctl", "--user", "stop"] for command in self.systemd.calls))
+
+    def test_uninstall_modified_program_refuses_before_service_change(self):
+        self.install()
+        relay = self.home / ".local/lib/astra-herdr-relay/relay.py"
+        relay.write_bytes(b"user modification")
+        calls_before = len(self.systemd.calls)
+        with self.assertRaisesRegex(self.installer.InstallError, "已被修改"):
+            self.installer.uninstall(self.home, runner=self.systemd, proc_root=self.proc)
+        self.assertEqual(relay.read_bytes(), b"user modification")
+        self.assertFalse(any(command[:3] == ["systemctl", "--user", "stop"]
+                             for command in self.systemd.calls[calls_before:]))
+
+    def test_rollback_rejects_tampered_and_escaping_backup_before_changes(self):
+        prior_relay = self.home / ".local/lib/astra-herdr-relay/relay.py"
+        prior_relay.parent.mkdir(parents=True)
+        prior_relay.write_bytes(b"previous relay")
+        installed = self.install()
+        _, ledgers, backups, _ = self.installer._metadata_paths(self.home)
+        ledger_path = ledgers / f"{installed['backup_id']}.json"
+        ledger = json.loads(ledger_path.read_text())
+        backup_rel = ledger["originals"][".local/lib/astra-herdr-relay/relay.py"]["backup_path"]
+        outside = self.base / "outside"
+        outside.write_bytes(b"untouched")
+        (self.home / backup_rel).unlink()
+        (self.home / backup_rel).symlink_to(outside)
+        with self.assertRaises(self.installer.InstallError):
+            self.installer.rollback(self.home, installed["backup_id"], runner=self.systemd,
+                                    proc_root=self.proc)
+        self.assertEqual(outside.read_bytes(), b"untouched")
+        self.assertTrue((self.home / ".local/lib/astra-herdr-relay/relay.py").is_file())
+        self.assertFalse(any(command[:3] == ["systemctl", "--user", "stop"] for command in self.systemd.calls))
+        self.assertTrue(backups.is_dir())
+
+    def test_rollback_rejects_backup_path_escape_and_unknown_id(self):
+        prior = self.home / ".local/lib/astra-herdr-relay/relay.py"
+        prior.parent.mkdir(parents=True)
+        prior.write_bytes(b"prior")
+        installed = self.install()
+        _, ledgers, _, _ = self.installer._metadata_paths(self.home)
+        ledger_path = ledgers / f"{installed['backup_id']}.json"
+        ledger = json.loads(ledger_path.read_text())
+        ledger["originals"][".local/lib/astra-herdr-relay/relay.py"]["backup_path"] = "../../outside"
+        ledger_path.write_text(json.dumps(ledger))
+        outside = self.base / "outside"
+        outside.write_bytes(b"outside")
+        calls_before = len(self.systemd.calls)
+        with self.assertRaisesRegex(self.installer.InstallError, "备份路径"):
+            self.installer.rollback(self.home, installed["backup_id"], runner=self.systemd,
+                                    proc_root=self.proc)
+        self.assertEqual(outside.read_bytes(), b"outside")
+        self.assertFalse(any(command[:3] == ["systemctl", "--user", "stop"]
+                             for command in self.systemd.calls[calls_before:]))
+        with self.assertRaisesRegex(self.installer.InstallError, "版本链"):
+            self.installer.rollback(self.home, "0" * 32, runner=self.systemd, proc_root=self.proc)
+
+    def test_rollback_rejects_backup_hash_tampering(self):
+        prior = self.home / ".local/lib/astra-herdr-relay/relay.py"
+        prior.parent.mkdir(parents=True)
+        prior.write_bytes(b"prior")
+        installed = self.install()
+        ledger = self.installer._load_ledger(self.home, installed["backup_id"])
+        backup_rel = ledger["originals"][".local/lib/astra-herdr-relay/relay.py"]["backup_path"]
+        (self.home / backup_rel).write_bytes(b"tampered")
+        with self.assertRaisesRegex(self.installer.InstallError, "哈希校验失败"):
+            self.installer.rollback(self.home, installed["backup_id"], runner=self.systemd,
+                                    proc_root=self.proc)
+        self.assertTrue(self.systemd.active)
+
+    def test_rollback_failure_restores_current_install_and_pointer(self):
+        first = self.install()
+        relay = self.home / ".local/lib/astra-herdr-relay/relay.py"
+        previous = relay.read_bytes()
+        source_relay = self.source / "lib/relay.py"
+        source_relay.write_bytes(source_relay.read_bytes() + b"\n# newer\n")
+        self.refresh_manifest()
+        second = self.install()
+        current = relay.read_bytes()
+        self.systemd.fail_next_start = True
+        with self.assertRaisesRegex(self.installer.InstallError, "回滚失败"):
+            self.installer.rollback(self.home, second["backup_id"], runner=self.systemd,
+                                    proc_root=self.proc)
+        self.assertEqual(relay.read_bytes(), current)
+        self.assertEqual(self.installer._load_current(self.home), second["backup_id"])
+        self.assertTrue(self.systemd.active and self.systemd.enabled)
+        self.assertNotEqual(relay.read_bytes(), previous)
+
+    def test_uninstall_failure_restores_files_service_hooks_and_config(self):
+        self.install()
+        relay = self.home / ".local/lib/astra-herdr-relay/relay.py"
+        before = relay.read_bytes()
+        hooks = (self.home / ".codex/hooks.json").read_bytes()
+        config = self.home / ".config/astra-herdr-relay/secret.env"
+        config.write_text("KEEP=secret\n")
+        self.systemd.fail_next_daemon_reload = True
+        with self.assertRaisesRegex(self.installer.InstallError, "卸载失败"):
+            self.installer.uninstall(self.home, runner=self.systemd, proc_root=self.proc)
+        self.assertEqual(relay.read_bytes(), before)
+        self.assertEqual((self.home / ".codex/hooks.json").read_bytes(), hooks)
+        self.assertEqual(config.read_text(), "KEEP=secret\n")
+        self.assertTrue(self.systemd.active and self.systemd.enabled)
+        self.assertTrue((self.home / ".local/state/astra-herdr-relay/install-errors.jsonl").is_file())
+
     def test_check_mode_is_read_only(self):
         before = sorted(str(p.relative_to(self.home)) for p in self.home.rglob("*"))
         self.assertEqual(self.install(check=True)["mode"], "check")
         self.assertEqual(sorted(str(p.relative_to(self.home)) for p in self.home.rglob("*")), before)
+
+    def test_unknown_service_transition_state_refuses_maintenance(self):
+        class UnknownService:
+            def __call__(self, command, **kwargs):
+                class Result:
+                    returncode, stdout, stderr = 0, "", ""
+                result = Result()
+                if command[-1:] == ["show-environment"]:
+                    return result
+                result.stdout = "LoadState=loaded\nActiveState=activating\nUnitFileState=enabled\nMainPID=123\n"
+                return result
+
+        with self.assertRaisesRegex(self.installer.InstallError, "未知或正在转换"):
+            self.installer._service_state(UnknownService())
 
     def test_fresh_install_creates_program_and_secret_defaults(self):
         self.install()

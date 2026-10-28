@@ -42,6 +42,14 @@
 
 # Changelog
 
+## 安装生命周期批次
+
+- 新增 `uninstall.sh`、`rollback.sh` 与 Python `uninstall`、`rollback`、`list-backups` 命令。
+- 成功安装创建权限受限的所有权账本和 SHA-256 程序快照；回滚必须指定当前版本链中的备份 ID。
+- 卸载保留配置、密钥、registry、任务、锁、事件和备份；只移除哈希匹配的受管程序及 Relay 自有 Hook/AGENTS 片段。
+- 三种变更共用活动任务/进程预检、维护排空和失败恢复；不操作 Herdr 标签，不执行 systemd 全局 reset。
+- 新增临时 root、fake systemctl/proc 生命周期回归；未执行真实安装。
+
 ## 0.5.0
 - Clean baseline after the v0.2-v0.4 upgrade chain.
 - Added deterministic Astra -> Relay `SPAWN_AGENT` behavior via `astra-agent-spawn`.
