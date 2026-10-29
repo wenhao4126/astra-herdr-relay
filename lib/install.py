@@ -150,20 +150,24 @@ def _service_state(runner):
         raise InstallError("systemd Relay unit 状态未知，拒绝操作")
     if fields["ActiveState"] not in {"active", "inactive"}:
         raise InstallError("systemd Relay active 状态未知或正在转换，拒绝操作")
-    if fields["UnitFileState"] not in {"enabled", "enabled-runtime", "disabled"}:
+    unit_file_state = fields["UnitFileState"]
+    if (fields["LoadState"] == "not-found" and fields["ActiveState"] == "inactive" and
+            fields["MainPID"] == "0" and unit_file_state == ""):
+        unit_file_state = "disabled"
+    if unit_file_state not in {"enabled", "enabled-runtime", "disabled"}:
         raise InstallError("systemd Relay enabled 状态未知，拒绝操作")
     installed = fields["LoadState"] == "loaded"
     if installed and not fields.get("ActiveState"):
         raise InstallError("systemd 未能确认现有服务状态")
     if fields["ActiveState"] == "active" and (not fields["MainPID"].isdecimal() or fields["MainPID"] == "0"):
         raise InstallError("systemd Relay MainPID 无效，按未知状态拒绝操作")
-    if not installed and (fields["ActiveState"] == "active" or fields["UnitFileState"] != "disabled"):
+    if not installed and (fields["ActiveState"] == "active" or unit_file_state != "disabled"):
         raise InstallError("systemd 报告 unit 不存在但服务仍 active/enabled，拒绝操作")
     return {
         "installed": installed,
         "active": fields.get("ActiveState") == "active",
-        "enabled": fields.get("UnitFileState") in {"enabled", "enabled-runtime"},
-        "unit_state": fields.get("UnitFileState", "disabled"),
+        "enabled": unit_file_state in {"enabled", "enabled-runtime"},
+        "unit_state": unit_file_state,
         "main_pid": fields.get("MainPID", "0"),
     }
 
@@ -1139,7 +1143,8 @@ def install(source, root, *, runner=subprocess.run, proc_root=Path("/proc"), che
             return _install(source, root, runner=runner, proc_root=proc_root, check=False,
                             drain_timeout=drain_timeout)
     except Exception as exc:
-        _record_error(root, "install", exc)
+        if not check:
+            _record_error(root, "install", exc)
         raise
 
 

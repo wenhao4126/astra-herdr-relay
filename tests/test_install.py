@@ -29,6 +29,7 @@ class FakeSystemd:
         self.wrong_exec_path = False
         self.exec_path_override = None
         self.fail_next_daemon_reload = False
+        self.status_output_override = None
         self.on_stop = None
         self.calls = []
 
@@ -48,7 +49,8 @@ class FakeSystemd:
                              f"{self.home}/.local/bin/astra-relayd")
                 result.stdout = f"FragmentPath={self.fragment_path}\nExecStart={{ path={exec_path} ; argv[]={{...}} ; }}\n"
                 return result
-            result.stdout = ("LoadState=not-found\nActiveState=inactive\nUnitFileState=disabled\nMainPID=0\n"
+            result.stdout = (self.status_output_override if self.status_output_override is not None else
+                             "LoadState=not-found\nActiveState=inactive\nUnitFileState=disabled\nMainPID=0\n"
                              if not self.installed else
                              f"LoadState=loaded\nActiveState={'active' if self.active else 'inactive'}\n"
                              f"UnitFileState={'enabled' if self.enabled else 'disabled'}\n"
@@ -130,6 +132,58 @@ class InstallTests(unittest.TestCase):
         manifest = "".join(f"{hashlib.sha256((self.source / rel).read_bytes()).hexdigest()}  {rel}\n"
                            for rel in self.installer.REQUIRED_FILES)
         (self.source / "MANIFEST.sha256").write_text(manifest, encoding="utf-8")
+
+    def test_not_found_inactive_pid_zero_empty_unit_file_state_is_disabled(self):
+        self.systemd.status_output_override = (
+            "LoadState=not-found\nActiveState=inactive\nUnitFileState=\nMainPID=0\n")
+        state = self.installer._service_state(self.systemd)
+        self.assertEqual(state["installed"], False)
+        self.assertEqual(state["active"], False)
+        self.assertEqual(state["enabled"], False)
+        self.assertEqual(state["unit_state"], "disabled")
+
+    def test_loaded_empty_unit_file_state_is_rejected(self):
+        self.systemd.status_output_override = (
+            "LoadState=loaded\nActiveState=inactive\nUnitFileState=\nMainPID=0\n")
+        with self.assertRaisesRegex(self.installer.InstallError, "enabled 状态未知"):
+            self.installer._service_state(self.systemd)
+
+    def test_missing_unit_file_state_is_rejected(self):
+        self.systemd.status_output_override = "LoadState=not-found\nActiveState=inactive\nMainPID=0\n"
+        with self.assertRaisesRegex(self.installer.InstallError, "状态字段不完整"):
+            self.installer._service_state(self.systemd)
+
+    def test_not_found_active_empty_unit_file_state_is_rejected(self):
+        self.systemd.status_output_override = (
+            "LoadState=not-found\nActiveState=active\nUnitFileState=\nMainPID=123\n")
+        with self.assertRaisesRegex(self.installer.InstallError, "enabled 状态未知"):
+            self.installer._service_state(self.systemd)
+
+    def test_not_found_enabled_unit_file_state_is_rejected(self):
+        self.systemd.status_output_override = (
+            "LoadState=not-found\nActiveState=inactive\nUnitFileState=enabled\nMainPID=0\n")
+        with self.assertRaisesRegex(self.installer.InstallError, "unit 不存在但服务仍 active/enabled"):
+            self.installer._service_state(self.systemd)
+
+    def test_not_found_empty_unit_file_state_with_nonzero_pid_is_rejected(self):
+        self.systemd.status_output_override = (
+            "LoadState=not-found\nActiveState=inactive\nUnitFileState=\nMainPID=123\n")
+        with self.assertRaisesRegex(self.installer.InstallError, "enabled 状态未知"):
+            self.installer._service_state(self.systemd)
+
+    def test_install_check_failure_does_not_write_anything(self):
+        self.systemd.status_output_override = (
+            "LoadState=loaded\nActiveState=inactive\nUnitFileState=\nMainPID=0\n")
+        before = sorted((str(path.relative_to(self.home)), path.is_dir(),
+                         path.read_bytes() if path.is_file() else None)
+                        for path in self.home.rglob("*"))
+        with self.assertRaises(self.installer.InstallError):
+            self.install(check=True)
+        after = sorted((str(path.relative_to(self.home)), path.is_dir(),
+                        path.read_bytes() if path.is_file() else None)
+                       for path in self.home.rglob("*"))
+        self.assertEqual(after, before)
+        self.assertFalse((self.home / ".local/state/astra-herdr-relay/install-errors.jsonl").exists())
 
     def test_install_ledger_is_private_and_list_backups_is_read_only(self):
         result = self.install()

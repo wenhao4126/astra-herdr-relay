@@ -186,7 +186,7 @@ cd astra-herdr-relay-v0.5.0-fixed-20260923
 
 上面的命令使用当前源码目录；不要从同层旧 `.tar.zst` 解压后安装本次优化。安装会修改用户目录中的程序和服务，执行前先确认 Relay 没有活动任务。当前源码的修改没有自动安装到本机。
 
-`--check` 只运行预检，不修改目标目录。`uninstall.sh` 与 `rollback.sh` 也支持 `--root <目录>` 和 `--check`；默认 root 是当前用户的 HOME。使用真实 user systemd runner 时，`--root` 必须等于当前 HOME；非 HOME root 仅允许通过注入的隔离 fake runner 测试，CLI 会在查询服务前拒绝，以免程序文件与 unit 实际路径错配。`rollback.sh` 必须给出 `--backup-id`，有效 ID 先由 `rollback.sh list-backups` 列出。只有当前安装账本对应的回滚点适用于当前版本链；工具不会猜测备份或接受任意路径。
+`--check` 只运行预检，不修改目标目录；预检失败也不写安装错误账本。`uninstall.sh` 与 `rollback.sh` 也支持 `--root <目录>` 和 `--check`；默认 root 是当前用户的 HOME。使用真实 user systemd runner 时，`--root` 必须等于当前 HOME；非 HOME root 仅允许通过注入的隔离 fake runner 测试，CLI 会在查询服务前拒绝，以免程序文件与 unit 实际路径错配。`rollback.sh` 必须给出 `--backup-id`，有效 ID 先由 `rollback.sh list-backups` 列出。只有当前安装账本对应的回滚点适用于当前版本链；工具不会猜测备份或接受任意路径。
 
 每次成功安装都会在 `~/.local/state/astra-herdr-relay/install-ledgers/` 保存私有安装账本，并在 `install-backups/<backup-id>/` 保存受管程序原快照。卸载只在程序 SHA-256 仍与账本一致时删除本 Relay 安装的程序与 unit；用户修改过的受管文件会让操作在停服务前拒绝。卸载移除账本记录的 Relay Hook 规则和 AGENTS 标记块，保留其他 Hook、用户文档、配置、密钥、运行状态、任务锁、事件、registry 和备份。当前版本不提供 purge。
 
