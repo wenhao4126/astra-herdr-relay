@@ -57,29 +57,41 @@ Probability validation rejects booleans (`true`/`false`) even though Python norm
 
 ### 结构化任务门禁
 
-所有派发入口都要求完整任务包 JSON；旧的自由文本 `delegate`、`dispatch-opaque` 和 Hook `spawn_agent.message` 不再作为任务内容接受。任务摘要使用规范 JSON SHA-256，并绑定当前规则版本。先对任务文件运行一次 Jev 评估，再使用完全相同的文件或消息派发：
+新任务使用 `schema_version=2`。v1 仍可做旧式任务校验和 Jev 评估，但不能进入新版 `review` / `final` 阶段。所有派发入口都要求完整 JSON 任务包；旧的自由文本 `delegate`、`dispatch-opaque` 和 Hook `spawn_agent.message` 会明确拒绝。摘要用规范 JSON SHA-256 绑定完整任务包与门禁规则版本。
+
+Context7 查询由调用方显式完成，`record-doc` 只登记 Agent 声明及可核对来源，并计算资料摘要；它不证明摘录内容真实或结论正确。任务只有把资料 ID 列入 `required_doc_ids` 才会要求记录存在、状态为 `verified` 且项目版本及摘要匹配。纯本地任务可不引用资料，但需在 `evidence_policy.no_external_docs_reason` 写明原因。示例资料记录基于已查询的 TypeSafe 文档：
+
+```bash
+astra-relay record-doc --json-file examples/context7-typesafe-score-choice.json
+```
+
+命令输出的 `content_sha256` 应写入 v2 任务包的 `docs` 引用。可从样例复制任务包并改成目标项目的绝对路径、任务范围和验收条件：
+
+```bash
+cp examples/task-v2-context7.json /tmp/relay-task.json
+```
+
+样例结构和一条本地任务结构如下：
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "task_id": "relay-readme-example",
   "revision": 1,
-  "goal": "在指定范围完成实现并提交验证证据",
-  "scope": {"allowed": ["lib/relay.py", "tests/"], "forbidden": ["真实配置", "其他项目"]},
-  "behavior": {
-    "inputs": ["本任务包及仓库现状"],
-    "outputs": ["实现结果和测试证据"],
-    "errors": ["输入不合法时明确拒绝"],
-    "compatibility": ["保留未授权范围外的行为"]
-  },
-  "acceptance": ["指定测试通过", "提交结果包含可核查证据"],
-  "evidence_policy": ["记录实际执行的命令和结果"],
+  "goal": "在指定范围完成实现并交付可核查证据",
+  "scope": {"allowed": ["src/", "tests/"], "forbidden": ["真实配置", "其他项目"]},
+  "behavior": {"inputs": ["任务包"], "outputs": ["实现与证据"],
+    "errors": ["非法输入明确拒绝"], "compatibility": ["保留既有接口"]},
+  "acceptance": ["指定验收项通过"],
+  "evidence_policy": {"review": ["tests"], "final": ["tests", "review"],
+    "no_external_docs_reason": "本任务仅依赖本地代码与测试，不依赖外部接口。"},
   "docs": [],
-  "working_directory": "/home/wen/projects/astra-herdr-relay-next"
+  "required_doc_ids": [],
+  "working_directory": "/绝对路径/现存项目目录"
 }
 ```
 
-将 `working_directory` 改成要处理的、已存在且规范化的真实绝对目录。操作链如下：
+使用外部资料时，将相应 `{id, project_version, content_sha256}` 引用放入 `docs`，并把所需 ID 写入 `required_doc_ids`，同时将本地原因置空。运行 `validate-task`、`evaluate-task` 并按完全相同的任务文件派发：
 
 ```bash
 astra-relay validate-task --task-file /tmp/relay-task.json
@@ -89,11 +101,52 @@ astra-relay dispatch-task --task-file /tmp/relay-task.json --role fixer \
   --session "$ASTRA_HERDR_SESSION" --request-id req-relay-readme-example
 ```
 
-当前 Jev 门禁以五维 Score（权重 20/20/25/15/20，总分至少 95）和五项 Choice 阻断检查组成；每项阻断必须为 `absent` 且置信度至少 0.95。缺字段、类型错误、非有限数值、越界分数、接口异常或任何未知阻断均拒绝。判定凭证由 Relay 本地按任务摘要、规则版本和模型版本保存。`docs` 目前只把调用方声明的来源、版本和 SHA-256 纳入任务包摘要；此版本没有实现完整 Context7 拉取、来源验证和资料快照协议，不应据此宣称完整 Relay 架构已经完成。
+Jev 派发门禁使用五维 Score（权重 20/20/25/15/20，总分至少 95）与五项 Choice 阻断检查；每项阻断必须为 `absent` 且置信度至少 0.95。缺字段、错误类型、非有限或越界数值、API 异常和未知阻断均拒绝。批准由 Relay 本地按任务摘要、规则版本、模型和资料摘要保存。Jev 只接收任务需要的资料摘录，不调用 Context7；资料摘要保证登记内容未变，不是语义真实性证明。
 
-### 可选的最终审查门
+### 三阶段快照与证据
 
-将 `ASTRA_RELAY_FINAL_REVIEW_ENABLED=1` 写入 Relay 配置后，Astra 才会在显式调用 `finalize <task_id>` 时进入最终审查门。运行中的 Jev Sensor 和 v0.5.0 旧 Reviewer 均保持原行为。最终审查先取得独立 OCR 的 `ReviewResult`，再将其作为证据交给 Jev 判断。OCR 不启动 Agent、不修改代码，也不接收 Claude 的结论。
+完成派发后，主代理提供明确的交付文件清单，再捕获当前快照。清单要包含实际交付文件，包括未跟踪文件；新增交付文件必须由主代理更新清单并重新捕获。快照仅证明所列路径在捕获时的内容摘要，不代表整个仓库正确。路径必须在任务 `working_directory` 内，且不能经过符号链接。
+
+```bash
+astra-relay capture-artifact --task-file /tmp/relay-task.json \
+  --files-file /tmp/delivery-files.json --runtime-task-id <dispatch 返回的 task_id>
+astra-relay validate-stage --task-file /tmp/relay-task.json --stage review
+```
+
+`delivery-files.json` 是相对工作目录的路径数组，例如 `["src/change.py", "tests/test_change.py"]`。报告需由外部测试者或审核者产出，再通过 `record-evidence --json-file <文件>` 登记；Relay 核对报告存在、路径安全和 SHA-256，不执行报告路径，也不证明报告中的结论属实。测试、构建和 lint 只有 `passed` 计为成功；`completed` 不等于通过。Review 必须使用与作者不同的 producer 身份及独立 session，Review 阶段本身不要求已有 Review 证据。
+
+证据记录模板中的两个任务摘要取自前面的任务/快照输出，报告路径相对于 `working_directory`，报告 SHA-256 必须由调用方对报告文件实际计算：
+
+```json
+{
+  "id": "tests-run-20261029",
+  "task_sha256": "<任务摘要>",
+  "artifact_sha256": "<制品摘要>",
+  "kind": "tests",
+  "producer_id": "isolated-test-runner",
+  "producer_role": "tester",
+  "session_id": "independent-test-session",
+  "status": "passed",
+  "report_path": "reports/tests.json",
+  "report_sha256": "<报告文件的 SHA-256>",
+  "created_at": "2026-10-29T06:00:00+08:00"
+}
+```
+
+最终阶段始终要求当前快照、任务策略所需的执行证据、独立 `review` 和 Relay 本地 Jev 判断。v2 仅在任务 `evidence_policy.final` 列出 `ocr_review` 时要求 OCR；旧 `ASTRA_RELAY_FINAL_REVIEW_ENABLED=1` 只影响 v1 兼容的旧终审路径。需要 OCR 时，登记报告必须是完整的规范 ReviewResult。运行最终评估并核验阶段：
+
+```bash
+astra-relay record-evidence --json-file /tmp/review-evidence.json
+astra-relay validate-stage --task-file /tmp/relay-task.json --stage final
+astra-relay evaluate-final --task-file /tmp/relay-task.json
+astra-relay validate-stage --task-file /tmp/relay-task.json --stage final
+```
+
+`evaluate-final` 复用现有类型化 Jev Review 接口，不输出自然语言理由。判定绑定任务、制品和全部证据摘要；任务、文件或证据变化都会使旧 Jev 判定失效。Jev 失败对相同摘要不会自动重试。`PASS` / `ACCEPT_WITH_NOTES` 只让 final 阶段进入 `principal_decision`，仍由主代理作最终决策；`REWORK`、`DEEP_REVIEW`、`BLOCKED` 不放行。旧 `record-final-evidence` 对 v2 仅保留 legacy 记录，不能替代新证据或 Jev 判定。
+
+### 旧式最终审查兼容
+
+v1 旧任务维持原有 `record-final-evidence` 和 `finalize` 路径。`ASTRA_RELAY_FINAL_REVIEW_ENABLED=1` 时，旧式显式 `finalize <task_id>` 会调用 OCR，再将其结果交给 Jev。OCR 不启动 Agent、不修改代码，也不接收 Claude 的结论。v2 任务则使用上面的显式快照/证据/`evaluate-final` 流程；final 成功后状态为等待主代理决策，不自动标记全局完成。
 
 日常代码审查由 Astra 显式调用 `astra-relay start-review-pair --cwd <项目路径>`：命令复用 registry 中活跃的固定 Codex worker 与 OpenCode reviewer，只为缺失或已停止的代理创建标签。OpenCode 模型由用户自行设置，Relay 不传 `--model`；返回的 `reused` 将模型状态标记为 `unverified`。任一代理未进入 `IDLE` 都不会报告 pair 完成。单独启动该 reviewer 时使用：
 

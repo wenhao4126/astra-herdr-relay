@@ -69,7 +69,7 @@ def _blocker_question(key: str):
     }
 
 
-def build_request(task, model: str):
+def build_request(task, model: str, *, doc_context=None):
     task = validate_task(task)
     if type(model) is not str or not model.strip():
         raise GateError("TASK_GATE_CONFIG_INVALID", "TypeSafe model 必须是非空字符串")
@@ -77,12 +77,17 @@ def build_request(task, model: str):
     questions = {"score_" + key: _score_question(key) for key, _ in SCORE_DIMENSIONS}
     questions.update({"blocker_" + key: _blocker_question(key)
                       for key in BLOCKER_DIMENSIONS})
+    state = {
+        "task_package": task,
+        "task_sha256": digest,
+        "rules_version": RULES_VERSION,
+    }
+    if task["schema_version"] == 2:
+        if doc_context is None and task["required_doc_ids"]:
+            raise GateError("DOC_REQUIRED_MISSING", "TypeSafe 评估缺少已登记的必需资料摘录")
+        state["context_documents"] = doc_context or []
     return {
-        "state": {
-            "task_package": task,
-            "task_sha256": digest,
-            "rules_version": RULES_VERSION,
-        },
+        "state": state,
         "model": model,
         "questions": questions,
     }
@@ -223,7 +228,14 @@ def evaluate_once(task, model: str, api_key: str, state_dir, *, requester=None,
         raise GateError("TASK_GATE_CONFIG_INVALID", "TypeSafe API key 未配置")
     if type(timeout) not in {int, float} or type(timeout) is bool or timeout <= 0:
         raise GateError("TASK_GATE_CONFIG_INVALID", "TypeSafe timeout 必须大于零")
-    payload = build_request(task, model)
+    doc_context = None
+    if type(task) is dict and task.get("schema_version") == 2:
+        try:
+            from doc_registry import load_required_docs
+            doc_context = load_required_docs(task, state_dir)
+        except Exception as exc:
+            raise GateError(getattr(exc, "code", "DOC_RECORD_INVALID"), str(exc)) from exc
+    payload = build_request(task, model, doc_context=doc_context)
     fingerprint, task_digest, evidence_digest = cache_fingerprint(task, model)
     directory = Path(state_dir) / "gates"
     record_path = directory / (fingerprint + ".json")
@@ -294,7 +306,12 @@ def evaluate_once(task, model: str, api_key: str, state_dir, *, requester=None,
 def approval_matches(task, model: str, state_dir) -> bool:
     try:
         fingerprint, task_digest, evidence_digest = cache_fingerprint(task, model)
+        if task["schema_version"] == 2:
+            from doc_registry import load_required_docs
+            load_required_docs(task, state_dir)
     except (ValueError, TypeError):
+        return False
+    except Exception:
         return False
     record = _read_json(Path(state_dir) / "gates" / (fingerprint + ".json"))
     return bool(record and record.get("status") == "APPROVED" and
@@ -306,6 +323,12 @@ def approval_matches(task, model: str, state_dir) -> bool:
 
 
 def require_approval(task, model: str, state_dir) -> str:
+    if type(task) is dict and task.get("schema_version") == 2:
+        try:
+            from doc_registry import load_required_docs
+            load_required_docs(task, state_dir)
+        except Exception as exc:
+            raise GateError(getattr(exc, "code", "DOC_RECORD_INVALID"), str(exc)) from exc
     if not approval_matches(task, model, state_dir):
         raise GateError("TASK_GATE_REQUIRED", "没有与当前任务摘要、规则、模型和资料版本匹配的 Jev 批准")
     return canonical_digest(task)

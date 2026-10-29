@@ -6,14 +6,17 @@ import re
 from pathlib import Path
 
 
-SCHEMA_VERSION = 1
-RULES_VERSION = "relay-task-gate-v1"
-TASK_KEYS = {
+SCHEMA_VERSION = 2
+RULES_VERSION = "relay-task-gate-v2"
+TASK_KEYS_V1 = {
     "schema_version", "task_id", "revision", "goal", "scope", "behavior",
     "acceptance", "evidence_policy", "docs", "working_directory",
 }
+TASK_KEYS_V2 = TASK_KEYS_V1 | {"required_doc_ids"}
 BEHAVIOR_KEYS = {"inputs", "outputs", "errors", "compatibility"}
 DOC_KEYS = {"source", "version", "sha256"}
+DOC_REF_KEYS = {"id", "project_version", "content_sha256"}
+EVIDENCE_KINDS = {"tests", "build", "lint", "review", "ocr_review"}
 
 
 class TaskContractError(ValueError):
@@ -50,9 +53,11 @@ def _json_primitives(value, path: str = "任务包") -> None:
 def validate_task(value):
     _require(type(value) is dict, "任务包顶层必须是对象")
     _json_primitives(value)
-    _require(set(value) == TASK_KEYS, "任务包字段缺失或包含未知字段")
-    _require(type(value["schema_version"]) is int and value["schema_version"] == SCHEMA_VERSION,
-             "schema_version 必须是整数 1")
+    version = value.get("schema_version")
+    _require(type(version) is int and version in {1, SCHEMA_VERSION},
+             "schema_version 必须是整数 1 或 2")
+    expected_keys = TASK_KEYS_V1 if version == 1 else TASK_KEYS_V2
+    _require(set(value) == expected_keys, "任务包字段缺失或包含未知字段")
     _require(type(value["task_id"]) is str and
              re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", value["task_id"]) is not None,
              "task_id 格式无效")
@@ -73,19 +78,65 @@ def validate_task(value):
     for key in sorted(BEHAVIOR_KEYS):
         _strings(behavior[key], f"behavior.{key}")
     _strings(value["acceptance"], "acceptance")
-    _strings(value["evidence_policy"], "evidence_policy")
+    if version == 1:
+        _strings(value["evidence_policy"], "evidence_policy")
+    else:
+        policy = value["evidence_policy"]
+        policy_keys = {"review", "final", "no_external_docs_reason"}
+        _require(type(policy) is dict and set(policy) == policy_keys,
+                 "v2 evidence_policy 必须包含 review、final、no_external_docs_reason")
+        for stage in ("review", "final"):
+            kinds = policy[stage]
+            _require(type(kinds) is list and all(type(kind) is str for kind in kinds),
+                     f"evidence_policy.{stage} 必须是字符串数组")
+            _require(len(kinds) == len(set(kinds)),
+                     f"evidence_policy.{stage} 必须使用唯一证据 kind")
+            _require(all(kind in EVIDENCE_KINDS for kind in kinds),
+                     f"evidence_policy.{stage} 包含未知证据 kind")
+        _require(not set(policy["review"]) & {"review", "ocr_review"},
+                 "review 阶段不能要求 review/ocr_review 本身")
+        _require("review" in policy["final"] and
+                 set(policy["review"]).issubset(policy["final"]),
+                 "final 阶段必须包含独立 review 和 review 阶段必需证据")
+        _require(type(policy["no_external_docs_reason"]) is str,
+                 "evidence_policy.no_external_docs_reason 必须是字符串")
 
     docs = value["docs"]
     _require(type(docs) is list, "docs 必须是数组")
-    for index, doc in enumerate(docs):
-        _require(type(doc) is dict and set(doc) == DOC_KEYS,
-                 f"docs[{index}] 必须只包含 source、version、sha256")
-        for key in ("source", "version"):
-            _require(type(doc[key]) is str and bool(doc[key].strip()),
-                     f"docs[{index}].{key} 必须是非空字符串")
-        _require(type(doc["sha256"]) is str and
-                 re.fullmatch(r"[a-f0-9]{64}", doc["sha256"]) is not None,
-                 f"docs[{index}].sha256 必须是小写 SHA-256")
+    if version == 1:
+        for index, doc in enumerate(docs):
+            _require(type(doc) is dict and set(doc) == DOC_KEYS,
+                     f"docs[{index}] 必须只包含 source、version、sha256")
+            for key in ("source", "version"):
+                _require(type(doc[key]) is str and bool(doc[key].strip()),
+                         f"docs[{index}].{key} 必须是非空字符串")
+            _require(type(doc["sha256"]) is str and
+                     re.fullmatch(r"[a-f0-9]{64}", doc["sha256"]) is not None,
+                     f"docs[{index}].sha256 必须是小写 SHA-256")
+    else:
+        ids = []
+        for index, doc in enumerate(docs):
+            _require(type(doc) is dict and set(doc) == DOC_REF_KEYS,
+                     f"docs[{index}] 必须只包含 id、project_version、content_sha256")
+            _require(type(doc["id"]) is str and
+                     re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,95}", doc["id"]) is not None,
+                     f"docs[{index}].id 格式无效")
+            _require(type(doc["project_version"]) is str and bool(doc["project_version"].strip()),
+                     f"docs[{index}].project_version 必须是非空字符串")
+            _require(type(doc["content_sha256"]) is str and
+                     re.fullmatch(r"[a-f0-9]{64}", doc["content_sha256"]) is not None,
+                     f"docs[{index}].content_sha256 必须是小写 SHA-256")
+            ids.append(doc["id"])
+        _require(len(ids) == len(set(ids)), "docs 中的资料 ID 不能重复")
+        required_ids = value["required_doc_ids"]
+        _strings(required_ids, "required_doc_ids", nonempty=False)
+        _require(all(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,95}", doc_id)
+                     for doc_id in required_ids), "required_doc_ids 包含非法 ID")
+        _require(len(required_ids) == len(set(required_ids)), "required_doc_ids 不能重复")
+        _require(set(required_ids).issubset(ids), "required_doc_ids 必须出现在 docs 引用中")
+        if not required_ids:
+            _require(bool(value["evidence_policy"]["no_external_docs_reason"].strip()),
+                     "无必需外部资料时必须说明原因")
 
     cwd = value["working_directory"]
     _require(type(cwd) is str and bool(cwd), "working_directory 必须是绝对目录字符串")

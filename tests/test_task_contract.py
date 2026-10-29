@@ -28,6 +28,17 @@ def make_task(directory):
     }
 
 
+def make_task_v2(directory):
+    task = make_task(directory)
+    task.update(schema_version=2, required_doc_ids=[])
+    task["evidence_policy"] = {
+        "review": ["tests"],
+        "final": ["tests", "review"],
+        "no_external_docs_reason": "本任务只改本地协议与测试，不依赖外部接口。",
+    }
+    return task
+
+
 class TaskContractTests(unittest.TestCase):
     def test_canonical_digest_binds_all_package_fields_and_order(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -63,6 +74,48 @@ class TaskContractTests(unittest.TestCase):
                 validate_task(task)
             task = make_task(directory)
             task["evidence_policy"] = [1.5]
+            with self.assertRaises(TaskContractError):
+                validate_task(task)
+
+    def test_schema_v2_accepts_explicit_local_only_policy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(validate_task(make_task_v2(directory))["schema_version"], 2)
+
+    def test_schema_v2_requires_structured_evidence_policy_and_local_docs_reason(self):
+        with tempfile.TemporaryDirectory() as directory:
+            task = make_task_v2(directory)
+            task["evidence_policy"] = ["tests"]
+            with self.assertRaises(TaskContractError):
+                validate_task(task)
+            task = make_task_v2(directory)
+            task["evidence_policy"]["no_external_docs_reason"] = ""
+            with self.assertRaises(TaskContractError):
+                validate_task(task)
+
+    def test_schema_v2_requires_unique_versioned_document_references(self):
+        with tempfile.TemporaryDirectory() as directory:
+            task = make_task_v2(directory)
+            digest = "a" * 64
+            task["docs"] = [{"id": "typesafe-score-choice", "project_version": "0.5.0",
+                             "content_sha256": digest}]
+            task["required_doc_ids"] = ["typesafe-score-choice"]
+            self.assertEqual(validate_task(task)["required_doc_ids"], ["typesafe-score-choice"])
+            task["docs"].append(dict(task["docs"][0]))
+            with self.assertRaises(TaskContractError):
+                validate_task(task)
+
+    def test_schema_v2_rejects_review_requirement_at_review_stage(self):
+        with tempfile.TemporaryDirectory() as directory:
+            task = make_task_v2(directory)
+            task["evidence_policy"]["review"] = ["review"]
+            task["evidence_policy"]["final"] = ["review"]
+            with self.assertRaises(TaskContractError):
+                validate_task(task)
+
+    def test_schema_v2_policy_rejects_unhashable_kind_as_structured_contract_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            task = make_task_v2(directory)
+            task["evidence_policy"]["review"] = [["tests"]]
             with self.assertRaises(TaskContractError):
                 validate_task(task)
 

@@ -9,6 +9,10 @@ from typing import Any
 LIB_DIR=Path(__file__).resolve().parent
 if str(LIB_DIR) not in sys.path: sys.path.insert(0,str(LIB_DIR))
 import gates
+import artifact
+import doc_registry
+import evidence
+import stages
 from task_contract import TaskContractError, canonical_digest, canonical_json, validate_task
 
 VERSION="0.5.0"
@@ -84,12 +88,23 @@ def _require_task_approval(task):
     return digest
 
 def _load_task_file(filename):
-    try: value=json.loads(Path(filename).read_text(encoding="utf-8"))
+    try: value=_read_json_file(filename)
     except (OSError,ValueError) as exc:
         raise gates.GateError("TASK_PACKAGE_INVALID","无法读取合法 JSON 任务包") from exc
     try: return validate_task(value)
     except TaskContractError as exc:
         raise gates.GateError(exc.code,str(exc)) from exc
+
+def _read_json_file(filename):
+    def unique(pairs):
+        result={}
+        for key,value in pairs:
+            if key in result: raise ValueError("JSON 对象键重复")
+            result[key]=value
+        return result
+    def reject_constant(_value): raise ValueError("JSON 非有限常量无效")
+    return json.loads(Path(filename).read_text(encoding="utf-8"),
+                      object_pairs_hook=unique,parse_constant=reject_constant)
 
 def _structured_error(exc):
     return {"ok":False,"error":{"code":getattr(exc,"code","RELAY_ERROR"),"message":str(exc)}}
@@ -852,12 +867,17 @@ def sensor(name,force=False,observed=None):
     write_json(SEMANTIC/f"{name}.json",result); event("runtime_sensor",**{k:v for k,v in result.items() if k not in {"ts","event"}})
     return result
 
-def review(task_id,name,requirement,evidence,final_gate=False,has_ocr_findings=False):
+def review(task_id,name,requirement,evidence,final_gate=False,has_ocr_findings=False,
+           include_reasons=True):
     system="""You are Jev Reviewer. Return JSON only with probabilities 0..1:
 completion, requirement_match, result_confidence, needs_rework, needs_deep_review,
 evidence_quality, scope_compliance, missing_requirement, implementation_defect,
 insufficient_verification, ambiguous_requirement; plus route PASS|REWORK|DEEP_REVIEW|BLOCKED,
-rework_reason, deep_reason, confidence. Do not claim verification not present in evidence."""
+confidence. Do not claim verification not present in evidence."""
+    if include_reasons:
+        system += " Include concise rework_reason and deep_reason fields."
+    else:
+        system += " Do not produce reason, explanation, or plan fields."
     keys=["completion","requirement_match","result_confidence","needs_rework","needs_deep_review","evidence_quality","scope_compliance",
           "missing_requirement","implementation_defect","insufficient_verification","ambiguous_requirement","confidence"]
     if final_gate: keys.append("accept_with_notes")
@@ -866,7 +886,8 @@ rework_reason, deep_reason, confidence. Do not claim verification not present in
                    mode="final_review" if final_gate else "review")
         scores={k:prob(j.get(k,0),k) for k in keys}
     except Exception as e:
-        result={"ts":now(),"task_id":task_id,"agent":name,"route":"DEEP_REVIEW","error":str(e)}
+        error_message="Jev Review 接口评估失败" if not include_reasons else str(e)
+        result={"ts":now(),"task_id":task_id,"agent":name,"route":"DEEP_REVIEW","error":error_message}
         write_json(REVIEWS/f"{task_id}-{time.time_ns()}.json",result); event("review",**result)
         return result
     route=str(j.get("route","DEEP_REVIEW")).upper()
@@ -882,8 +903,10 @@ rework_reason, deep_reason, confidence. Do not claim verification not present in
     allowed={"PASS","REWORK","DEEP_REVIEW","BLOCKED"}
     if final_gate: allowed.add("ACCEPT_WITH_NOTES")
     if route not in allowed: route="DEEP_REVIEW"
-    result={"ts":now(),"task_id":task_id,"agent":name,"route":route,"scores":scores,
-            "rework_reason":str(j.get("rework_reason","")),"deep_reason":str(j.get("deep_reason",""))}
+    result={"ts":now(),"task_id":task_id,"agent":name,"route":route,"scores":scores}
+    if include_reasons:
+        result.update(rework_reason=str(j.get("rework_reason","")),
+                      deep_reason=str(j.get("deep_reason","")))
     write_json(REVIEWS/f"{task_id}-{int(now())}.json",result); event("review",**result)
     return result
 
@@ -994,6 +1017,12 @@ def record_final_evidence(task_id, artifacts):
             raise ValueError("任务不存在或不是异步任务")
         if state.get("final_state") or state.get("finalize_owner"):
             raise RuntimeError("任务已结算或正在结算")
+        package=state.get("task_package")
+        if type(package) is dict and package.get("schema_version")==2:
+            state["legacy_final_evidence"]=artifacts
+            write_json(path,state)
+            return {"task_id":task_id,"mode":"legacy-record-only",
+                    "warning":"旧终审证据不构成 schema_version=2 的阶段凭证"}
         state.update(artifacts)
         ready,reason=final_gate_evidence_ready(state)
         if not ready: raise ValueError(reason)
@@ -1049,10 +1078,64 @@ def begin_task(name,task_id,operation=None,operation_kind=None,expected_instance
     return rec
 
 def _task_prompt(task,marker,completion_marker):
-    return ("Relay schema_version=1 task package. Execute only this canonical JSON package.\n"
+    return (f"Relay schema_version={task['schema_version']} task package. Execute only this canonical JSON package.\n"
             f"{marker}\n"
             f"On completion, begin the final response with {completion_marker}, "
             "then provide result and verification evidence.\n"+canonical_json(task))
+
+def _capture_task_state(task, runtime_task_id=None):
+    digest=canonical_digest(task)
+    if TASKS.is_symlink() or (TASKS.exists() and not TASKS.is_dir()):
+        raise gates.GateError("TASK_STATE_INVALID","Relay task 状态目录无效")
+    candidates=[]
+    if runtime_task_id:
+        if type(runtime_task_id) is not str or not re.fullmatch(r"relay-[A-Za-z0-9_-]+",runtime_task_id):
+            raise gates.GateError("TASK_ID_INVALID","runtime-task-id 格式无效")
+        paths=[TASKS/(runtime_task_id+".json")]
+    else:
+        paths=sorted(TASKS.glob("relay-*.json")) if TASKS.exists() else []
+    for path in paths:
+        if path.is_symlink() or not path.is_file():
+            if runtime_task_id:
+                raise gates.GateError("TASK_STATE_INVALID","Relay task 状态必须是普通文件")
+            continue
+        state=read_json(path,None)
+        if type(state) is not dict or state.get("task_sha256")!=digest:
+            continue
+        package=state.get("task_package")
+        if type(package) is not dict or canonical_digest(package)!=digest:
+            continue
+        if state.get("dispatch_confirmed") is not True:
+            continue
+        author=state.get("author_instance")
+        if type(author) is dict:
+            candidates.append(author)
+    if not candidates:
+        raise gates.GateError("TASK_EXECUTION_NOT_FOUND","没有与任务摘要匹配且已确认派发的作者实例")
+    if len(candidates)!=1:
+        raise gates.GateError("TASK_EXECUTION_AMBIGUOUS","同一任务有多个运行实例；请显式指定 --runtime-task-id")
+    return candidates[0]
+
+def evaluate_final_task(task):
+    task=validate_task(task)
+    def jev_evaluator(context):
+        author=context["artifact"]["author_instance"]
+        has_ocr_findings=False
+        for record in context["evidence_records"]:
+            if record["kind"]!="ocr_review": continue
+            try:
+                report=json.loads(context["report_excerpts"][record["id"]])
+                findings=report.get("findings",report.get("comments",[]))
+                has_ocr_findings=has_ocr_findings or bool(findings)
+            except (ValueError,AttributeError):
+                has_ocr_findings=True
+        result=review(task["task_id"],author["producer_id"],canonical_json(task),
+                      canonical_json(context),final_gate=True,
+                      has_ocr_findings=has_ocr_findings,include_reasons=False)
+        if type(result) is not dict or result.get("error"):
+            raise stages.StageError("现有 Jev Review 接口评估失败", "JEV_EVALUATION_FAILED")
+        return {"route":result.get("route")}
+    return stages.evaluate_final(task,STATE,jev_evaluator)
 
 def _request_cached(claim):
     record=claim["record"]
@@ -1211,7 +1294,13 @@ def dispatch_opaque(name,task,parent_task_id=None,request_id=None):
                "created_at":now(),"dispatch_mode":"opaque_async","marker":marker,
                "completion_marker":completion_marker,"instance":agent_instance(rec),
                "herdr_session":session,
-               "herdr_agent_session_value":rec.get("herdr_agent_session_value")}
+               "herdr_agent_session_value":rec.get("herdr_agent_session_value"),
+               "author_instance":{"producer_id":name,"producer_role":rec.get("role"),
+                                  "session_id":session,"tab_id":rec.get("tab_id"),
+                                  "pane_id":rec.get("pane_id"),
+                                  **({"agent_session_value":rec["herdr_agent_session_value"]}
+                                     if type(rec.get("herdr_agent_session_value")) is str and
+                                     rec.get("herdr_agent_session_value") else {})}}
         write_json(TASKS/f"{task_id}.json",state)
         finish_request(claim,"DISPATCHING",task_id=task_id,herdr_session=session)
         try:
@@ -1346,7 +1435,7 @@ def send_opaque(name,message,request_id=None):
         return {"agent":name,"control":"stop","result":release(name)}
     if type(value) is dict:
         return dispatch_opaque(name,value,request_id=request_id)
-    raise gates.GateError("TASK_PACKAGE_REQUIRED","自由文本派发已关闭；需要 schema_version=1 任务包")
+    raise gates.GateError("TASK_PACKAGE_REQUIRED","自由文本派发已关闭；需要 schema_version=2 任务包")
 
 def finalize(task_id):
     """显式结算异步任务；审查结果交回 Astra，不自动派发返工。"""
@@ -1424,31 +1513,42 @@ def finalize(task_id):
                         state["frozen_runtime"]=second[0]
                         write_json(path,state)
                     review_started=True
-                    # OCR is deliberately outside the runtime Sensor loop and only
-                    # runs after the task evidence is frozen at the final gate.
-                    try:
-                        if FINAL_REVIEW_ENABLED:
-                            attempts=final_review_attempt_number(state)
-                            ready, reason=final_gate_evidence_ready(state)
-                            if state.get("phase")!="READY_FOR_FINAL" or not ready:
-                                verdict={"route":"DEEP_REVIEW","review_kind":"post_completion",
-                                         "error":"final_gate_evidence_incomplete","reason":reason}
-                            elif attempts>FINAL_REVIEW_MAX_REWORKS+1:
-                                verdict={"route":"ESCALATE","review_kind":"post_completion",
-                                         "error":"final_review_attempt_limit_reached"}
-                            else:
-                                repo=state.get("repo") or rec.get("cwd") or os.getcwd()
-                                verdict=final_review(task_id,name,state["requirement"],current_evidence,repo)
+                    if (type(state.get("task_package")) is dict and
+                            state["task_package"].get("schema_version")==2):
+                        stage=stages.validate_stage(state["task_package"],"final",STATE)
+                        decision=stage.get("decision")
+                        if stage.get("ready_for_next_stage"):
+                            final="AWAITING_PRINCIPAL"
+                        elif stage.get("valid") and decision in {"REWORK","DEEP_REVIEW","BLOCKED"}:
+                            final=decision
                         else:
-                            verdict=review(task_id,name,state["requirement"],current_evidence)
-                    except Exception as error: verdict={"route":"DEEP_REVIEW","error":str(error)}
-                    route=verdict.get("route")
-                    final="DONE" if route in {"PASS","ACCEPT_WITH_NOTES"} else route if route in {"REWORK","BLOCKED","DEEP_REVIEW","HUMAN_REVIEW","ESCALATE"} else "DEEP_REVIEW"
-                    result={"final_state":final,"last_review":verdict}
-                    if FINAL_REVIEW_ENABLED:
-                        result["review_outcome"]=verdict.get("review_outcome",{"decision":route or "DEEP_REVIEW","notes":[]})
-                    if FINAL_REVIEW_ENABLED and ready and attempts<=FINAL_REVIEW_MAX_REWORKS+1:
-                        result["final_review_attempts"]=attempts
+                            final="HUMAN_REVIEW"
+                        result={"final_state":final,"stage_validation":stage}
+                    else:
+                        # 旧任务继续使用既有 Jev/OCR 路径；v2 只能读取已绑定摘要的 Jev 决定。
+                        try:
+                            if FINAL_REVIEW_ENABLED:
+                                attempts=final_review_attempt_number(state)
+                                ready, reason=final_gate_evidence_ready(state)
+                                if state.get("phase")!="READY_FOR_FINAL" or not ready:
+                                    verdict={"route":"DEEP_REVIEW","review_kind":"post_completion",
+                                             "error":"final_gate_evidence_incomplete","reason":reason}
+                                elif attempts>FINAL_REVIEW_MAX_REWORKS+1:
+                                    verdict={"route":"ESCALATE","review_kind":"post_completion",
+                                             "error":"final_review_attempt_limit_reached"}
+                                else:
+                                    repo=state.get("repo") or rec.get("cwd") or os.getcwd()
+                                    verdict=final_review(task_id,name,state["requirement"],current_evidence,repo)
+                            else:
+                                verdict=review(task_id,name,state["requirement"],current_evidence)
+                        except Exception as error: verdict={"route":"DEEP_REVIEW","error":str(error)}
+                        route=verdict.get("route")
+                        final="DONE" if route in {"PASS","ACCEPT_WITH_NOTES"} else route if route in {"REWORK","BLOCKED","DEEP_REVIEW","HUMAN_REVIEW","ESCALATE"} else "DEEP_REVIEW"
+                        result={"final_state":final,"last_review":verdict}
+                        if FINAL_REVIEW_ENABLED:
+                            result["review_outcome"]=verdict.get("review_outcome",{"decision":route or "DEEP_REVIEW","notes":[]})
+                        if FINAL_REVIEW_ENABLED and ready and attempts<=FINAL_REVIEW_MAX_REWORKS+1:
+                            result["final_review_attempts"]=attempts
                     if sample()!=second:
                         stopped=False
                         result.update(final_state="HUMAN_REVIEW",error="审查期间运行态或输出变化，结果作废",review_invalidated=True)
@@ -1648,7 +1748,12 @@ def main(argv=None):
     p=sp.add_parser("start-review-pair"); p.add_argument("--cwd",default=".")
     p=sp.add_parser("release"); p.add_argument("name")
     p=sp.add_parser("finalize"); p.add_argument("task_id")
-    p=sp.add_parser("record-final-evidence"); p.add_argument("task_id"); p.add_argument("--json-file",required=True)
+    p=sp.add_parser("record-final-evidence",help="登记兼容终审记录；v2 不以此放行"); p.add_argument("task_id"); p.add_argument("--json-file",required=True)
+    p=sp.add_parser("record-doc",help="登记 Context7 资料声明并计算资料摘要"); p.add_argument("--json-file",required=True)
+    p=sp.add_parser("capture-artifact",help="按显式文件清单创建当前交付快照"); p.add_argument("--task-file",required=True); p.add_argument("--files-file",required=True); p.add_argument("--runtime-task-id")
+    p=sp.add_parser("record-evidence",help="校验并登记外部证据报告"); p.add_argument("--json-file",required=True)
+    p=sp.add_parser("validate-stage",help="检查任务在指定阶段的证据门禁"); p.add_argument("--task-file",required=True); p.add_argument("--stage",choices=("dispatch","review","final"),required=True)
+    p=sp.add_parser("evaluate-final",help="通过现有 Jev 接口评估当前最终证据摘要"); p.add_argument("--task-file",required=True)
     p=sp.add_parser("delegate"); p.add_argument("name"); p.add_argument("prompt",nargs="?"); p.add_argument("--task-file"); p.add_argument("--parent-task-id"); p.add_argument("--request-id")
     p=sp.add_parser("dispatch-opaque"); p.add_argument("name"); p.add_argument("--task-file"); p.add_argument("--prompt-file"); p.add_argument("--parent-task-id"); p.add_argument("--request-id")
     p=sp.add_parser("send-opaque"); p.add_argument("name"); p.add_argument("--message-file",required=True); p.add_argument("--request-id")
@@ -1660,6 +1765,7 @@ def main(argv=None):
     try:
         if a.cmd=="validate-task":
             task=_load_task_file(a.task_file); digest=canonical_digest(task)
+            doc_registry.load_required_docs(task,STATE)
             if a.require_approved: gates.require_approval(task,TYPESAFE_MODEL,STATE)
             result={"ok":True,"task_sha256":digest,"rules_version":gates.RULES_VERSION,
                     "task_id":task["task_id"],"revision":task["revision"],
@@ -1679,15 +1785,38 @@ def main(argv=None):
         elif a.cmd=="release": result=release(a.name)
         elif a.cmd=="finalize": result=finalize(a.task_id)
         elif a.cmd=="record-final-evidence":
-            result=record_final_evidence(a.task_id,json.loads(Path(a.json_file).read_text(encoding="utf-8")))
+            result=record_final_evidence(a.task_id,_read_json_file(a.json_file))
+        elif a.cmd=="record-doc":
+            record=doc_registry.record_doc(_read_json_file(a.json_file),STATE)
+            result={"ok":True,"id":record["id"],"status":record["status"],
+                    "content_sha256":record["content_sha256"],"semantic_verified":False}
+        elif a.cmd=="capture-artifact":
+            task=_load_task_file(a.task_file)
+            author=_capture_task_state(task,a.runtime_task_id)
+            record=artifact.capture_artifact(task,artifact.load_files_file(a.files_file),STATE,author)
+            result={"ok":True,"task_sha256":record["task_sha256"],
+                    "artifact_sha256":record["artifact_sha256"],"files":record["files"],
+                    "author_instance":record["author_instance"],"created_at":record["created_at"],
+                    "delivery_scope":record["delivery_scope"]}
+        elif a.cmd=="record-evidence":
+            record=evidence.record_evidence(_read_json_file(a.json_file),STATE)
+            result={"ok":True,"id":record["id"],"task_sha256":record["task_sha256"],
+                    "artifact_sha256":record["artifact_sha256"],"kind":record["kind"],
+                    "status":record["status"],"report_sha256":record["report_sha256"]}
+        elif a.cmd=="validate-stage":
+            task=_load_task_file(a.task_file)
+            result=stages.validate_stage(task,a.stage,STATE,
+                                         approved=gates.approval_matches(task,TYPESAFE_MODEL,STATE))
+        elif a.cmd=="evaluate-final":
+            result=evaluate_final_task(_load_task_file(a.task_file))
         elif a.cmd in {"delegate","dispatch-opaque"}:
             task_file=a.task_file if a.cmd=="delegate" else a.task_file
             legacy_file=a.prompt_file if a.cmd=="dispatch-opaque" else None
             if not task_file and legacy_file:
-                try: parsed=json.loads(Path(legacy_file).read_text(encoding="utf-8"))
+                try: parsed=_read_json_file(legacy_file)
                 except Exception: parsed=None
                 if type(parsed) is dict and "schema_version" in parsed: task=parsed
-                else: raise gates.GateError("TASK_PACKAGE_REQUIRED","自由文本旧入口已关闭；需要 schema_version=1 任务包")
+                else: raise gates.GateError("TASK_PACKAGE_REQUIRED","自由文本旧入口已关闭；需要 schema_version=1 或 2 任务包")
             elif task_file: task=_load_task_file(task_file)
             else: raise gates.GateError("TASK_PACKAGE_REQUIRED","此入口必须提供 --task-file 版本化任务包")
             request_id=a.request_id
@@ -1706,7 +1835,8 @@ def main(argv=None):
         if isinstance(result,dict) and (result.get("ok") is False or result.get("accepted") is False or
               result.get("status") in {"UNKNOWN","FAILED","STALE"} or
               (a.cmd=="delegate" and result.get("final_state")!="DONE") or
-              (a.cmd=="finalize" and result.get("final_state")!="DONE") or
+              (a.cmd=="finalize" and result.get("final_state") not in {"DONE","AWAITING_PRINCIPAL"}) or
+              (a.cmd in {"validate-stage","evaluate-final"} and not result.get("ready_for_next_stage")) or
               (a.cmd=="start-review-pair" and not result.get("complete"))): return 1
         return 0
     except Exception as exc:

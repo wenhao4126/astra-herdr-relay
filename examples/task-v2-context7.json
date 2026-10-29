@@ -1,0 +1,31 @@
+{
+  "schema_version": 2,
+  "task_id": "relay-context7-protocol-example",
+  "revision": 1,
+  "goal": "按任务包和证据协议完成指定实现并交由主代理裁决",
+  "scope": {
+    "allowed": ["lib/gates.py", "tests/", "README.md", "AGENTS.relay.block.md"],
+    "forbidden": ["真实配置", "其他项目", "真实部署"]
+  },
+  "behavior": {
+    "inputs": ["本任务 JSON 与所列 Context7 资料记录"],
+    "outputs": ["实现、测试报告、审核报告与阶段证据"],
+    "errors": ["缺少资料、摘要不匹配或证据变更时结构化拒绝"],
+    "compatibility": ["schema_version=1 仍可按旧格式校验"]
+  },
+  "acceptance": ["review 阶段当前快照与必需测试证据有效", "final Jev 只绑定当前任务、制品和证据摘要"],
+  "evidence_policy": {
+    "review": ["tests", "build", "lint"],
+    "final": ["tests", "build", "lint", "review"],
+    "no_external_docs_reason": ""
+  },
+  "docs": [
+    {
+      "id": "typesafe-score-choice-0.5.0",
+      "project_version": "0.5.0",
+      "content_sha256": "c83c016f48456fc6b276f94e417ae29d623b57ee86be61aea06a371e054b70ff"
+    }
+  ],
+  "required_doc_ids": ["typesafe-score-choice-0.5.0"],
+  "working_directory": "/home/wen/projects/astra-herdr-relay-next"
+}

@@ -1,0 +1,12 @@
+{
+  "id": "typesafe-score-choice-0.5.0",
+  "question": "TypeSafe 的 Score、Choice 与 Noul 分别用于什么问题？",
+  "library_id": "/typesafe-docs/typesafeai",
+  "project_version": "0.5.0",
+  "source_url": "https://github.com/typesafe-docs/typesafeai/blob/main/docs/04-primitives/README.md",
+  "excerpt": "Score 用有序等级表示程度；Choice 从有限类别中选择；Noul 给出是/否概率，不能表示程度。",
+  "conclusion": "明确度等级采用 Score，阻断类别采用 Choice；不以 Noul 概率替代等级分数。",
+  "limitations": "该资料说明原语语义，不规定 Relay 的权重、阈值或通过策略。",
+  "retrieved_at": "2026-10-28T23:42:33Z",
+  "status": "verified"
+}
