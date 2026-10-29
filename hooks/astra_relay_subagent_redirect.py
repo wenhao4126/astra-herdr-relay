@@ -115,7 +115,7 @@ try:
             try: package=json.loads(package)
             except ValueError: package=None
         if type(package) is not dict:
-            deny("TASK_PACKAGE_REQUIRED: spawn_agent.message 必须是 schema_version=1 的任务包 JSON；普通自由文本不会派发。")
+            deny("TASK_PACKAGE_REQUIRED: spawn_agent.message 必须是 schema_version=1 或 2 的任务包 JSON；新任务使用 v2，普通自由文本不会派发。")
             raise SystemExit(0)
         event_cwd=Path(cwd).resolve(strict=True)
         if not event_cwd.is_dir() or package.get("working_directory")!=str(event_cwd):

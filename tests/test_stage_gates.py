@@ -85,6 +85,42 @@ class StageGateTests(unittest.TestCase):
         self.assertTrue(second["ready_for_next_stage"], second)
         self.assertEqual(len(calls), 2)
 
+    def test_final_jev_is_bound_to_complete_author_instance_identity(self):
+        self.add_evidence("tests", "passed", "identity-tests")
+        self.add_evidence("review", "completed", "identity-review")
+        original = dict(self.snapshot["author_instance"])
+        first = stages.evaluate_final(self.task, self.state, lambda _context: {"route": "PASS"})
+        self.assertTrue(first["ready_for_next_stage"], first)
+        original_snapshot = artifact.verify_current_snapshot(self.task, self.state)
+        expected_digest = hashlib.sha256(json.dumps(
+            original, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")).hexdigest()
+        saved = json.loads(next((self.state / "final_jev").glob("*.json")).read_text())
+        self.assertEqual(saved["author_identity_sha256"], expected_digest)
+
+        identity_changes = {
+            "producer_id": "executor-2",
+            "producer_role": "fixer",
+            "session_id": "session-executor-replaced",
+            "tab_id": "tab-replaced",
+            "pane_id": "pane-replaced",
+            "agent_session_value": "herdr-agent-replaced",
+        }
+        for field, value in identity_changes.items():
+            with self.subTest(identity_field=field):
+                changed = dict(original)
+                changed[field] = value
+                recaptured = artifact.capture_artifact(self.task, ["code.py"],
+                                                       self.state, changed)
+                self.assertEqual(recaptured["artifact_sha256"],
+                                 original_snapshot["artifact_sha256"])
+                stale = stages.validate_stage(self.task, "final", self.state)
+                self.assertIn("JEV_DECISION_REQUIRED",
+                              [error["code"] for error in stale["errors"]])
+                refreshed = stages.evaluate_final(
+                    self.task, self.state, lambda _context: {"route": "PASS"})
+                self.assertTrue(refreshed["ready_for_next_stage"], refreshed)
+
     def test_failed_jev_is_unknown_and_is_not_retried_for_same_digests(self):
         self.add_evidence("tests", "passed", "tests-jev-failed")
         self.add_evidence("review", "completed", "review-jev-failed")

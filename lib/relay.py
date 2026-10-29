@@ -1146,8 +1146,11 @@ def _request_cached(claim):
             "error":{"code":record.get("error_code","REQUEST_NOT_REPLAYED"),"message":"该请求已有记录，未重放"}}
 
 def delegate(name,task,parent_task_id=None,request_id=None):
-    digest=_require_task_approval(task)
     task=validate_task(task)
+    if task["schema_version"]==2:
+        raise gates.GateError("V2_ASYNC_REQUIRED",
+                              "schema_version=2 必须使用 dispatch-task 或 dispatch-opaque；同步 delegate 仅保留 v1 兼容，不会降级任务版本")
+    digest=_require_task_approval(task)
     request_id=_request_id(request_id)
     with request_claim(request_id,"DELEGATE",digest,name) as claim:
         if not claim["claimed"]: return _request_cached(claim)

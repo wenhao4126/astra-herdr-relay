@@ -18,7 +18,7 @@ from task_contract import TaskContractError, canonical_digest, canonical_json, d
 
 ROUTES = {"PASS", "ACCEPT_WITH_NOTES", "REWORK", "DEEP_REVIEW", "BLOCKED"}
 DECISION_KEYS = {"schema_version", "task_sha256", "artifact_sha256", "evidence_sha256",
-                 "status", "route", "error_code", "created_at"}
+                 "author_identity_sha256", "status", "route", "error_code", "created_at"}
 SHA256 = re.compile(r"[a-f0-9]{64}\Z")
 
 
@@ -61,16 +61,20 @@ def _evidence_digest(records):
     return hashlib.sha256(canonical_json(included).encode("utf-8")).hexdigest()
 
 
-def _decision_path(task_sha256, artifact_sha256, evidence_sha256, state_dir, *, create=False):
+def _decision_path(task_sha256, artifact_sha256, evidence_sha256,
+                   author_identity_sha256, state_dir, *, create=False):
     identity = {"task_sha256": task_sha256, "artifact_sha256": artifact_sha256,
-                "evidence_sha256": evidence_sha256}
+                "evidence_sha256": evidence_sha256,
+                "author_identity_sha256": author_identity_sha256}
     key = hashlib.sha256(canonical_json(identity).encode("utf-8")).hexdigest()
     directory = _private_dir(state_dir, "final_jev", create=create)
     return directory, directory / f"{key}.json", directory / f"{key}.lock"
 
 
-def _read_decision(task_sha256, artifact_sha256, evidence_sha256, state_dir):
-    directory, path, _ = _decision_path(task_sha256, artifact_sha256, evidence_sha256, state_dir)
+def _read_decision(task_sha256, artifact_sha256, evidence_sha256,
+                   author_identity_sha256, state_dir):
+    directory, path, _ = _decision_path(task_sha256, artifact_sha256, evidence_sha256,
+                                        author_identity_sha256, state_dir)
     if not directory.exists():
         return None
     if path.is_symlink():
@@ -88,6 +92,7 @@ def _read_decision(task_sha256, artifact_sha256, evidence_sha256, state_dir):
             record.get("task_sha256") != task_sha256 or
             record.get("artifact_sha256") != artifact_sha256 or
             record.get("evidence_sha256") != evidence_sha256 or
+            record.get("author_identity_sha256") != author_identity_sha256 or
             record.get("status") not in {"evaluated", "failed"} or
             record.get("error_code") not in {"", "JEV_RESPONSE_INVALID", "JEV_EVALUATION_FAILED"} or
             record.get("route") not in ROUTES | {"UNKNOWN"}):
@@ -144,6 +149,8 @@ def _collect(task, stage, state_dir, *, approved=False):
     try:
         snapshot = artifact.verify_current_snapshot(task, state_dir)
         result["artifact_sha256"] = snapshot["artifact_sha256"]
+        result["author_identity_sha256"] = hashlib.sha256(
+            canonical_json(snapshot["author_instance"]).encode("utf-8")).hexdigest()
         records = evidence.load_evidence_records(task_sha, snapshot["artifact_sha256"], state_dir)
         result["evidence_sha256"] = _evidence_digest(records)
     except artifact.ArtifactError as exc:
@@ -174,7 +181,8 @@ def _collect(task, stage, state_dir, *, approved=False):
     if errors:
         return result
     decision = _read_decision(task_sha, snapshot["artifact_sha256"],
-                              result["evidence_sha256"], state_dir)
+                              result["evidence_sha256"],
+                              result["author_identity_sha256"], state_dir)
     if decision is None:
         errors.append({"code": "JEV_DECISION_REQUIRED",
                        "message": "缺少绑定当前任务、制品和证据摘要的 Relay Jev 判断"})
@@ -208,7 +216,8 @@ def evaluate_final(task, state_dir, jev_evaluator):
                   "errors": errors, "gaps": collected["gaps"],
                   "task_sha256": collected.get("task_sha256"),
                   "artifact_sha256": collected.get("artifact_sha256"),
-                  "evidence_sha256": collected.get("evidence_sha256")}
+                  "evidence_sha256": collected.get("evidence_sha256"),
+                  "author_identity_sha256": collected.get("author_identity_sha256")}
         if ([item["code"] for item in errors] == ["JEV_EVALUATION_FAILED"] and
                 collected.get("decision_status") == "failed"):
             result.update(route="UNKNOWN", cached=True)
@@ -216,7 +225,9 @@ def evaluate_final(task, state_dir, jev_evaluator):
     task_sha = collected["task_sha256"]
     artifact_sha = collected["artifact_sha256"]
     evidence_sha = collected["evidence_sha256"]
+    author_identity_sha = collected["author_identity_sha256"]
     directory, path, lock_path = _decision_path(task_sha, artifact_sha, evidence_sha,
+                                                author_identity_sha,
                                                 state_dir, create=True)
     if lock_path.is_symlink():
         return {"valid": False, "ready_for_next_stage": False,
@@ -235,7 +246,8 @@ def evaluate_final(task, state_dir, jev_evaluator):
         os.fchmod(fd, 0o600)
         with os.fdopen(fd, "a", encoding="utf-8", closefd=False) as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
-            record = _read_decision(task_sha, artifact_sha, evidence_sha, state_dir)
+            record = _read_decision(task_sha, artifact_sha, evidence_sha,
+                                    author_identity_sha, state_dir)
             cached = record is not None
             if record is None:
                 try:
@@ -246,6 +258,7 @@ def evaluate_final(task, state_dir, jev_evaluator):
                                for item in records}
                     context = {"task_package": task, "task_sha256": task_sha,
                                "artifact_sha256": artifact_sha, "evidence_sha256": evidence_sha,
+                               "author_identity_sha256": author_identity_sha,
                                "artifact": {"files": snapshot["files"],
                                             "author_instance": snapshot["author_instance"],
                                             "delivery_scope": snapshot["delivery_scope"]},
@@ -268,6 +281,7 @@ def evaluate_final(task, state_dir, jev_evaluator):
                     route, status = "UNKNOWN", "failed"
                 record = {"schema_version": 1, "task_sha256": task_sha,
                           "artifact_sha256": artifact_sha, "evidence_sha256": evidence_sha,
+                          "author_identity_sha256": author_identity_sha,
                           "status": status, "route": route, "error_code": error_code,
                           "created_at": _timestamp()}
                 fd_tmp, temp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=directory)
@@ -292,6 +306,7 @@ def evaluate_final(task, state_dir, jev_evaluator):
             "route": record["route"], "cached": cached,
             "task_sha256": task_sha, "artifact_sha256": artifact_sha,
             "evidence_sha256": evidence_sha,
+            "author_identity_sha256": author_identity_sha,
             "errors": ([] if record["status"] == "evaluated" else
                        [{"code": record["error_code"], "message": "Jev 评估失败；相同摘要不会自动重试"}]),
             "gaps": ([] if record["status"] == "evaluated" and

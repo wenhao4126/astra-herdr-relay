@@ -57,7 +57,7 @@ Probability validation rejects booleans (`true`/`false`) even though Python norm
 
 ### 结构化任务门禁
 
-新任务使用 `schema_version=2`。v1 仍可做旧式任务校验和 Jev 评估，但不能进入新版 `review` / `final` 阶段。所有派发入口都要求完整 JSON 任务包；旧的自由文本 `delegate`、`dispatch-opaque` 和 Hook `spawn_agent.message` 会明确拒绝。摘要用规范 JSON SHA-256 绑定完整任务包与门禁规则版本。
+新任务使用 `schema_version=2`。v1 仍可做旧式任务校验、Jev 评估和同步 `delegate` 兼容，但不能进入新版 `review` / `final` 阶段。v2 通过同步 `delegate` 会以 `V2_ASYNC_REQUIRED` 拒绝，必须走 `dispatch-task` 或 `dispatch-opaque`；不会把任务静默降级为 v1。所有派发入口都要求完整 JSON 任务包；旧的自由文本 `delegate`、`dispatch-opaque` 和 Hook `spawn_agent.message` 会明确拒绝。摘要用规范 JSON SHA-256 绑定完整任务包与门禁规则版本。
 
 Context7 查询由调用方显式完成，`record-doc` 只登记 Agent 声明及可核对来源，并计算资料摘要；它不证明摘录内容真实或结论正确。任务只有把资料 ID 列入 `required_doc_ids` 才会要求记录存在、状态为 `verified` 且项目版本及摘要匹配。纯本地任务可不引用资料，但需在 `evidence_policy.no_external_docs_reason` 写明原因。示例资料记录基于已查询的 TypeSafe 文档：
 
@@ -142,7 +142,7 @@ astra-relay evaluate-final --task-file /tmp/relay-task.json
 astra-relay validate-stage --task-file /tmp/relay-task.json --stage final
 ```
 
-`evaluate-final` 复用现有类型化 Jev Review 接口，不输出自然语言理由。判定绑定任务、制品和全部证据摘要；任务、文件或证据变化都会使旧 Jev 判定失效。Jev 失败对相同摘要不会自动重试。`PASS` / `ACCEPT_WITH_NOTES` 只让 final 阶段进入 `principal_decision`，仍由主代理作最终决策；`REWORK`、`DEEP_REVIEW`、`BLOCKED` 不放行。旧 `record-final-evidence` 对 v2 仅保留 legacy 记录，不能替代新证据或 Jev 判定。
+`evaluate-final` 复用现有类型化 Jev Review 接口，不输出自然语言理由。判定绑定任务、制品、全部证据摘要和快照的完整作者实例身份；任务、文件、证据或作者/session/tab/pane/Herdr agent-session 身份变化都会使旧 Jev 判定失效。Jev 失败对相同摘要不会自动重试。`PASS` / `ACCEPT_WITH_NOTES` 只让 final 阶段进入 `principal_decision`，仍由主代理作最终决策；`REWORK`、`DEEP_REVIEW`、`BLOCKED` 不放行。旧 `record-final-evidence` 对 v2 仅保留 legacy 记录，不能替代新证据或 Jev 判定。
 
 ### 旧式最终审查兼容
 
