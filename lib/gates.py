@@ -45,12 +45,27 @@ BLOCKER_LABELS = {
 CONFIDENCE_THRESHOLD = 0.95
 SCORE_THRESHOLD = 95.0
 DEFAULT_URL = "https://api.typesafe.ai/v1/systemone"
+SAFE_RESPONSE_FIELDS = {"model", "answers"}
+for _dimension, _ in SCORE_DIMENSIONS:
+    _name = "score_" + _dimension
+    SAFE_RESPONSE_FIELDS.add(_name)
+    SAFE_RESPONSE_FIELDS.update(_name + "." + key
+                                 for key in ("score", "confidence", "legend", "probabilities"))
+    SAFE_RESPONSE_FIELDS.update(_name + ".probabilities." + str(level) for level in range(5))
+for _dimension in BLOCKER_DIMENSIONS:
+    _name = "blocker_" + _dimension
+    SAFE_RESPONSE_FIELDS.add(_name)
+    SAFE_RESPONSE_FIELDS.update(_name + "." + key
+                                 for key in ("choice", "confidence", "probabilities"))
+    SAFE_RESPONSE_FIELDS.update(_name + ".probabilities." + choice
+                                 for choice in BLOCKER_CHOICES)
 
 
 class GateError(ValueError):
-    def __init__(self, code: str, message: str):
+    def __init__(self, code: str, message: str, *, field=None):
         super().__init__(message)
         self.code = code
+        self.field = field if type(field) is str and field in SAFE_RESPONSE_FIELDS else None
 
 
 def _score_question(key: str):
@@ -94,67 +109,79 @@ def build_request(task, model: str, *, doc_context=None):
 
 
 def _number(value, name: str, minimum: float, maximum: float) -> float:
-    if type(value) not in {int, float} or not math.isfinite(value):
-        raise GateError("TASK_GATE_RESPONSE_INVALID", f"{name} 必须是有限数值")
+    if type(value) not in {int, float}:
+        raise GateError("TASK_GATE_RESPONSE_INVALID", f"{name} 必须是有限数值", field=name)
+    try:
+        finite = math.isfinite(value)
+    except OverflowError:
+        finite = False
+    if not finite:
+        raise GateError("TASK_GATE_RESPONSE_INVALID", f"{name} 必须是有限数值", field=name)
     number = float(value)
     if not minimum <= number <= maximum:
-        raise GateError("TASK_GATE_RESPONSE_INVALID", f"{name} 越界")
+        raise GateError("TASK_GATE_RESPONSE_INVALID", f"{name} 越界", field=name)
     return number
 
 
 def _probabilities(value, expected_keys, name: str):
     if type(value) is not dict or set(value) != set(expected_keys):
-        raise GateError("TASK_GATE_RESPONSE_INVALID", f"{name} 概率字段缺失或多余")
+        raise GateError("TASK_GATE_RESPONSE_INVALID", f"{name} 概率字段缺失或多余",
+                        field=name + ".probabilities")
     parsed = {key: _number(item, f"{name}.probabilities.{key}", 0, 1)
               for key, item in value.items()}
     if abs(sum(parsed.values()) - 1.0) > 0.02:
-        raise GateError("TASK_GATE_RESPONSE_INVALID", f"{name} 概率总和不为 1")
+        raise GateError("TASK_GATE_RESPONSE_INVALID", f"{name} 概率总和不为 1",
+                        field=name + ".probabilities")
     return parsed
 
 
 def _score_answer(answer, name: str):
     if type(answer) is not dict or answer.get("type") != "score":
-        raise GateError("TASK_GATE_RESPONSE_INVALID", f"{name} 不是 Score 答案")
+        raise GateError("TASK_GATE_RESPONSE_INVALID", f"{name} 不是 Score 答案", field=name)
     for key in ("score", "confidence", "legend", "probabilities"):
         if key not in answer:
-            raise GateError("TASK_GATE_RESPONSE_INVALID", f"{name}.{key} 缺失")
+            raise GateError("TASK_GATE_RESPONSE_INVALID", f"{name}.{key} 缺失",
+                            field=f"{name}.{key}")
     score = _number(answer["score"], f"{name}.score", 0, 4)
     confidence = _number(answer["confidence"], f"{name}.confidence", 0, 1)
     levels = tuple(str(i) for i in range(5))
     legend = answer["legend"]
     if type(legend) is not dict or set(legend) != set(levels) or any(
             type(label) is not str or not label.strip() for label in legend.values()):
-        raise GateError("TASK_GATE_RESPONSE_INVALID", f"{name}.legend 不符合五级量表")
+        raise GateError("TASK_GATE_RESPONSE_INVALID", f"{name}.legend 不符合五级量表",
+                        field=f"{name}.legend")
     probabilities = _probabilities(answer["probabilities"], levels, name)
     return {"score": score, "confidence": confidence, "probabilities": probabilities}
 
 
 def _choice_answer(answer, name: str):
     if type(answer) is not dict or answer.get("type") != "choice":
-        raise GateError("TASK_GATE_RESPONSE_INVALID", f"{name} 不是 Choice 答案")
+        raise GateError("TASK_GATE_RESPONSE_INVALID", f"{name} 不是 Choice 答案", field=name)
     for key in ("choice", "confidence", "probabilities"):
         if key not in answer:
-            raise GateError("TASK_GATE_RESPONSE_INVALID", f"{name}.{key} 缺失")
+            raise GateError("TASK_GATE_RESPONSE_INVALID", f"{name}.{key} 缺失",
+                            field=f"{name}.{key}")
     choice = answer["choice"]
     if type(choice) is not str or choice not in BLOCKER_CHOICES:
-        raise GateError("TASK_GATE_RESPONSE_INVALID", f"{name}.choice 非法")
+        raise GateError("TASK_GATE_RESPONSE_INVALID", f"{name}.choice 非法",
+                        field=f"{name}.choice")
     confidence = _number(answer["confidence"], f"{name}.confidence", 0, 1)
-    if confidence < CONFIDENCE_THRESHOLD:
-        raise GateError("TASK_GATE_RESPONSE_INVALID", f"{name}.confidence 低于门槛")
     probabilities = _probabilities(answer["probabilities"], BLOCKER_CHOICES, name)
     if probabilities[choice] != max(probabilities.values()):
-        raise GateError("TASK_GATE_RESPONSE_INVALID", f"{name}.choice 不是最高概率类别")
+        raise GateError("TASK_GATE_RESPONSE_INVALID", f"{name}.choice 不是最高概率类别",
+                        field=f"{name}.choice")
     return {"choice": choice, "confidence": confidence, "probabilities": probabilities}
 
 
 def parse_response(response):
     if type(response) is not dict or type(response.get("model")) is not str or not response["model"]:
-        raise GateError("TASK_GATE_RESPONSE_INVALID", "TypeSafe 响应缺少 model")
+        raise GateError("TASK_GATE_RESPONSE_INVALID", "TypeSafe 响应缺少 model", field="model")
     answers = response.get("answers")
     expected = ({"score_" + key for key, _ in SCORE_DIMENSIONS} |
                 {"blocker_" + key for key in BLOCKER_DIMENSIONS})
     if type(answers) is not dict or set(answers) != expected:
-        raise GateError("TASK_GATE_RESPONSE_INVALID", "TypeSafe answers 缺少或包含未知题目")
+        raise GateError("TASK_GATE_RESPONSE_INVALID", "TypeSafe answers 缺少或包含未知题目",
+                        field="answers")
     scores = {}
     weighted = 0.0
     for key, weight in SCORE_DIMENSIONS:
@@ -292,8 +319,9 @@ def evaluate_once(task, model: str, api_key: str, state_dir, *, requester=None,
             return record
         try:
             decision = parse_response(response)
-        except GateError:
+        except GateError as exc:
             record.update(status="FAILED", error_code="JEV_RESPONSE_INVALID",
+                          error_field=exc.field,
                           completed_at=time.time())
             _write_json(record_path, record)
             return record

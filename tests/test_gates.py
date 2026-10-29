@@ -78,13 +78,64 @@ class GateTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_response(response)
         response = valid_response()
-        response["answers"]["blocker_" + BLOCKER_DIMENSIONS[0]]["confidence"] = 0.94
-        with self.assertRaises(ValueError):
-            parse_response(response)
+        name = "blocker_" + BLOCKER_DIMENSIONS[0]
+        response["answers"][name]["confidence"] = 0.94
+        decision = parse_response(response)
+        self.assertEqual(set(decision),
+                         {"approved", "total_score", "scores", "blockers", "response_model"})
+        self.assertFalse(decision["approved"])
+        self.assertEqual(decision["total_score"], 100)
+        self.assertEqual(decision["blockers"][BLOCKER_DIMENSIONS[0]]["choice"], "absent")
+        self.assertEqual(decision["blockers"][BLOCKER_DIMENSIONS[0]]["confidence"], 0.94)
+        self.assertEqual(decision["blockers"][BLOCKER_DIMENSIONS[0]]["probabilities"],
+                         {"present": 0.0, "absent": 1.0, "unknown": 0.0})
         response = valid_response()
         response["answers"]["score_goal"]["probabilities"] = {"0": 0.4}
         with self.assertRaises(ValueError):
             parse_response(response)
+
+    def test_invalid_choice_confidence_is_failed_with_safe_field_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for index, invalid in enumerate((True, float("nan"), 1.01, -0.01)):
+                task = make_task(directory)
+                task["task_id"] = f"invalid-confidence-{index}"
+                response = valid_response()
+                response["answers"]["blocker_ambiguity"]["confidence"] = invalid
+                result = evaluate_once(
+                    task, "jev-test", "secret-for-test", Path(directory) / f"state-{index}",
+                    requester=lambda payload, api_key, timeout, value=response: value)
+                self.assertEqual(result["status"], "FAILED")
+                self.assertEqual(result["error_code"], "JEV_RESPONSE_INVALID")
+                self.assertEqual(result["error_field"], "blocker_ambiguity.confidence")
+                self.assertNotIn("response", result)
+                self.assertNotIn("headers", result)
+                self.assertNotIn("api_key", result)
+                self.assertNotIn("error_message", result)
+
+    def test_low_confidence_choice_is_cached_without_a_second_request(self):
+        with tempfile.TemporaryDirectory() as directory:
+            task = make_task(directory)
+            state = Path(directory) / "state"
+            response = valid_response()
+            response["answers"]["blocker_ambiguity"]["confidence"] = 0.91
+            calls = []
+
+            def requester(payload, api_key, timeout):
+                calls.append(payload)
+                return response
+
+            first = evaluate_once(task, "jev-test", "secret-for-test", state,
+                                  requester=requester)
+            second = evaluate_once(task, "jev-test", "secret-for-test", state,
+                                   requester=requester)
+
+            self.assertEqual(first["status"], "REJECTED")
+            self.assertFalse(first["approved"])
+            self.assertEqual(first["blockers"]["ambiguity"]["confidence"], 0.91)
+            self.assertEqual(first["blockers"]["ambiguity"]["choice"], "absent")
+            self.assertTrue(second["cached"])
+            self.assertEqual(second["blockers"], first["blockers"])
+            self.assertEqual(len(calls), 1)
 
     def test_evaluation_caches_one_attempt_and_binds_approval(self):
         with tempfile.TemporaryDirectory() as directory:
